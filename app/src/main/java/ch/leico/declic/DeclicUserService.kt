@@ -151,7 +151,7 @@ class DeclicUserService : IDeclicService.Stub() {
         }
     }
 
-    private inner class Reader(val path: String, val name: String) : Thread("declic-${path.substringAfterLast('/')}") {
+    private inner class Reader(val path: String, val devName: String) : Thread("declic-${path.substringAfterLast('/')}") {
         @Volatile var stopped = false
         @Volatile var stream: FileInputStream? = null
 
@@ -175,7 +175,7 @@ class DeclicUserService : IDeclicService.Stub() {
                         val type = bb.getShort(off + evSize - 8).toInt() and 0xffff
                         val code = bb.getShort(off + evSize - 6).toInt() and 0xffff
                         val value = bb.getInt(off + evSize - 4)
-                        onRawEvent(name, type, code, value)
+                        onRawEvent(devName, type, code, value)
                         off += evSize
                     }
                     pending = total - off
