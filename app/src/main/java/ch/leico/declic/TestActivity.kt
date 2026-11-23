@@ -25,7 +25,6 @@ class TestActivity : Activity() {
     private val h = android.os.Handler(android.os.Looper.getMainLooper())
     private val poll = object : Runnable {
         override fun run() {
-            if (Core.running) Core.send("Q")
             window.decorView.findViewById<View>(android.R.id.content)?.let { (it as? android.view.ViewGroup)?.getChildAt(0)?.invalidate() }
             h.postDelayed(this, 1000)
         }
@@ -34,7 +33,8 @@ class TestActivity : Activity() {
     override fun onResume() {
         super.onResume()
         Core.testOpen = true
-        Core.refreshTarget()
+        Core.uiOpen++
+        Core.update()
         h.post(poll)
     }
 
@@ -42,7 +42,8 @@ class TestActivity : Activity() {
         super.onPause()
         h.removeCallbacks(poll)
         Core.testOpen = false
-        Core.refreshTarget()
+        Core.uiOpen--
+        Core.update()
     }
 
     private class Pad(c: Context) : View(c) {
@@ -108,7 +109,7 @@ class TestActivity : Activity() {
             var y = 28 * dp
             canvas.drawText("Zone de test Déclic : pose des doigts + appuie sur ta touche", 12 * dp, y, white)
             y += 20 * dp
-            for (l in Core.engineInfo.split("\n")) {
+            for (l in Core.engineText().split("\n")) {
                 canvas.drawText(l.take(140), 12 * dp, y, grey)
                 y += 16 * dp
             }

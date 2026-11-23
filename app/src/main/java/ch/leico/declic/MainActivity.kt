@@ -12,11 +12,13 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.RadioButton
@@ -37,12 +39,11 @@ class MainActivity : Activity() {
     private lateinit var tvA11y: TextView
     private lateinit var btnA11y: Button
     private lateinit var tvEngine: TextView
-    private lateinit var tvTrigger: TextView
+    private lateinit var bindsBox: LinearLayout
     private lateinit var profilesBox: LinearLayout
 
     private val ticker = object : Runnable {
         override fun run() {
-            if (Core.running) Core.send("Q")
             refreshStatus()
             h.postDelayed(this, 1000)
         }
@@ -66,8 +67,9 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        Core.start()
-        refreshTrigger()
+        Core.uiOpen++
+        Core.update()
+        refreshBinds()
         refreshProfiles()
         h.post(ticker)
     }
@@ -75,6 +77,8 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         h.removeCallbacks(ticker)
+        Core.uiOpen--
+        Core.update()
     }
 
     // ---------- Construction de l'écran ----------
@@ -86,20 +90,14 @@ class MainActivity : Activity() {
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(gold)
         })
-        root.addView(text("Une touche → un appui sur l'écran, seulement dans les applis choisies.", grey, 14f))
+        root.addView(text("Tes touches → des appuis sur l'écran, seulement dans les applis choisies.", grey, 14f))
 
-        card("1 · Démarrage (débogage sans fil)").apply {
+        card("1 · Moteur").apply {
             tvEngine = text("", Color.WHITE, 13f).also { addView(it) }
-            addView(button("Démarrer") { Core.start() })
-            addView(text("Une seule fois : active les Options pour les développeurs et le « Débogage sans fil » (Wi-Fi allumé), puis touche « Associer » et suis la notification.\nAprès chaque redémarrage du téléphone : réactive le débogage sans fil, puis touche Démarrer.", grey, 12f))
+            addView(button("Démarrer") { Core.ensureEngine() })
+            addView(text("Le moteur se lance via le débogage sans fil, puis Déclic coupe le débogage : le moteur continue tout seul (même sans Wi-Fi), jusqu'au prochain redémarrage du téléphone.\nUne seule fois : active les Options pour les développeurs, puis « Associer ».", grey, 12f))
             addView(button("Associer (une seule fois)") { startPairing() })
-            addView(button("Ouvrir les options pour les développeurs") {
-                try {
-                    startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
-                } catch (_: Exception) {
-                    startActivity(Intent(Settings.ACTION_SETTINGS))
-                }
-            })
+            addView(button("Ouvrir les options pour les développeurs") { openDevSettings() })
         }
 
         card("2 · Service d'accessibilité").apply {
@@ -113,10 +111,10 @@ class MainActivity : Activity() {
             })
         }
 
-        card("3 · Ta touche").apply {
-            tvTrigger = text("", Color.WHITE, 14f).also { addView(it) }
-            addView(button("Détecter la touche") { detect() })
-            addView(text("Pense à régler l'action du Quick Button sur « Aucune » dans les paramètres du téléphone, sinon il ouvrira aussi l'appareil photo.", grey, 12f))
+        card("3 · Tes touches").apply {
+            addView(text("Coche les touches à utiliser. Si tu décoches tout, le moteur s'arrête.", grey, 12f))
+            bindsBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }.also { addView(it) }
+            addView(button("+ Ajouter une touche") { detect() })
         }
 
         card("4 · Applis").apply {
@@ -128,7 +126,7 @@ class MainActivity : Activity() {
                 thumbTintList = ColorStateList.valueOf(gold)
                 setOnCheckedChangeListener { _, c ->
                     Prefs.active = c
-                    Core.refreshTarget()
+                    Core.update()
                 }
             })
             profilesBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }.also { addView(it) }
@@ -139,7 +137,7 @@ class MainActivity : Activity() {
         }
 
         card("Réglage avancé · type d'appui").apply {
-            addView(text("A : dans les applis choisies, Déclic prend la main sur l'écran et y ajoute le doigt de la touche, pour que tu puisses diriger, booster et sauter en même temps. B : ancien mode, plus simple, mais l'appui peut annuler tes autres doigts.", grey, 12f))
+            addView(text("A : Déclic prend la main sur l'écran et y ajoute les doigts des touches, pour diriger, booster et sauter en même temps. B : plus simple, mais un appui peut annuler tes autres doigts.", grey, 12f))
             val rg = RadioGroup(this@MainActivity)
             listOf("A · Fusion multi-touch (conseillé)", "B · Simple").forEachIndexed { i, t ->
                 rg.addView(RadioButton(this@MainActivity).apply {
@@ -152,7 +150,7 @@ class MainActivity : Activity() {
             rg.check(100 + Prefs.injectMode)
             rg.setOnCheckedChangeListener { _, id ->
                 Prefs.injectMode = id - 100
-                Core.pushAll()
+                Core.update()
             }
             addView(rg)
         }
@@ -200,6 +198,14 @@ class MainActivity : Activity() {
 
     private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
 
+    private fun openDevSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
     // ---------- États ----------
 
     private fun a11yOn(): Boolean {
@@ -210,43 +216,59 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startPairing() {
-        if (android.os.Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
-            toast("Autorise les notifications, puis retouche « Associer ».")
-            return
-        }
-        Core.startPairDiscovery()
-        PairNotif.show(this, "Ouvre Débogage sans fil → « Associer l'appareil avec un code d'association », puis reviens ici (glisse le volet) pour taper le code.")
-        AlertDialog.Builder(this)
-            .setTitle("Association")
-            .setMessage("1. Dans Options pour les développeurs, touche « Débogage sans fil » (le texte, pas l'interrupteur).\n2. Touche « Associer l'appareil avec un code d'association ».\n3. Sans fermer cette fenêtre, descends le volet des notifications : dans celle de Déclic, touche « Entrer le code » et tape le code à 6 chiffres.")
-            .setPositiveButton("C'est parti") { _, _ ->
-                try {
-                    startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
-                } catch (_: Exception) {
-                    startActivity(Intent(Settings.ACTION_SETTINGS))
-                }
-            }
-            .show()
-    }
-
     private fun refreshStatus() {
         val a = a11yOn() && ForegroundWatcher.instance != null
         tvA11y.text = if (a) "✓ Activé" else "✗ Pas activé : Réglages → Accessibilité → Applis installées → Déclic"
         btnA11y.visibility = if (a) View.GONE else View.VISIBLE
 
-        tvEngine.text = if (Core.running) Core.status + (if (Core.engineInfo.isNotEmpty()) "\n" + Core.engineInfo else "") else Core.status
+        val alive = Core.engineAlive()
+        val sb = StringBuilder()
+        sb.append(if (alive) Core.engineText() else if (Core.starting) "Démarrage du moteur…" else "✗ Moteur arrêté")
+        if (Core.startMsg.isNotEmpty() && !Core.starting) sb.append("\n").append(Core.startMsg)
+        sb.append("\nActivation automatique du débogage : ").append(if (Core.canToggleDebug()) "✓ autorisée" else "pas encore (elle s'autorise au premier démarrage)")
+        tvEngine.text = sb.toString()
     }
 
-    private fun refreshTrigger() {
-        val d = Prefs.trigDevice
-        tvTrigger.text = if (d.isNullOrEmpty()) "Aucune touche choisie." else "✓ ${evName(Prefs.trigType, Prefs.trigCode)}\nsur « $d »"
-    }
+    // ---------- Touches ----------
 
-    // ---------- Détection de la touche ----------
+    private fun refreshBinds() {
+        bindsBox.removeAllViews()
+        val list = Prefs.binds()
+        if (list.isEmpty()) {
+            bindsBox.addView(text("Aucune touche pour l'instant.", grey, 13f))
+            return
+        }
+        for (b in list) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            row.addView(CheckBox(this).apply {
+                text = "${b.name}\n${b.dev}"
+                setTextColor(Color.WHITE)
+                buttonTintList = ColorStateList.valueOf(gold)
+                isChecked = b.enabled
+                setOnCheckedChangeListener { _, c ->
+                    Prefs.setBindEnabled(b.id, c)
+                    Core.update()
+                    refreshProfiles()
+                }
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(button("Supprimer") {
+                AlertDialog.Builder(this)
+                    .setMessage("Supprimer « ${b.name} » et ses positions ?")
+                    .setPositiveButton("Supprimer") { _, _ ->
+                        Prefs.removeBind(b.id)
+                        Core.update()
+                        refreshBinds()
+                        refreshProfiles()
+                    }
+                    .setNegativeButton("Annuler", null)
+                    .show()
+            })
+            bindsBox.addView(row)
+        }
+    }
 
     private class Det(val dev: String, val type: Int, val code: Int, val firstAt: Long) {
         var count = 0
@@ -254,30 +276,36 @@ class MainActivity : Activity() {
     }
 
     private fun evName(type: Int, code: Int): String {
-        val t = when (type) {
-            1 -> "Touche"; 2 -> "REL"; 3 -> "ABS"; 4 -> "MSC"; 5 -> "Interrupteur"; else -> "Type $type"
+        if (type == 1) return when (code) {
+            115 -> "Volume +"
+            114 -> "Volume −"
+            116 -> "Marche/arrêt"
+            212 -> "Appareil photo"
+            722 -> "Quick Button (appui)"
+            724 -> "Quick Button (double appui)"
+            330 -> "Toucher (330)"
+            else -> "Touche $code"
         }
-        val known = if (type == 1) when (code) {
-            212 -> " (CAMERA)"; 528 -> " (CAMERA_FOCUS)"; 330 -> " (TOUCH)"; 115 -> " (VOLUME +)"
-            114 -> " (VOLUME −)"; 116 -> " (POWER)"; else -> ""
-        } else ""
-        return "$t $code$known"
+        val t = when (type) {
+            2 -> "REL"; 3 -> "ABS"; 4 -> "MSC"; 5 -> "Interrupteur"; else -> "Type $type"
+        }
+        return "$t $code"
     }
 
     private fun detect() {
-        if (!Core.running) return toast("Le moteur n'est pas démarré : termine d'abord l'étape 1.")
+        if (!Core.engineAlive()) return toast("Le moteur n'est pas lancé : touche « Démarrer » dans la carte 1.")
         val items = ArrayList<Det>()
         val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1)
         val list = ListView(this).apply { this.adapter = adapter }
         var open = true
+        var t0 = 0L
         val dlg = AlertDialog.Builder(this)
             .setTitle("Appuie sur ta touche…")
-            .setMessage("Sans toucher l'écran : appuie UNE fois sur la touche, puis attends 3 secondes. Le chrono indique quand chaque signal est arrivé après le premier : choisis le signal le plus rapide (+0 ms) qui réagit à ta touche. « Effacer » pour recommencer.")
+            .setMessage("Sans toucher l'écran : appuie sur la touche (ou fais le geste voulu), puis touche la ligne correspondante. Le chrono indique quand chaque signal est arrivé. « Effacer » pour recommencer.")
             .setView(list)
             .setNegativeButton("Fermer", null)
             .setNeutralButton("Effacer", null)
             .create()
-        var t0 = 0L
 
         fun redraw() {
             items.sortWith(compareBy<Det> { it.firstAt })
@@ -285,10 +313,26 @@ class MainActivity : Activity() {
             adapter.addAll(items.map { "+${it.firstAt} ms · ${evName(it.type, it.code)} · ×${it.count} · valeur ${it.value}\n${it.dev}" })
         }
 
-        val listener: (String, Int, Int, Int) -> Unit = { dev, type, code, value ->
-            runOnUiThread {
+        list.setOnItemClickListener { _, _, pos, _ ->
+            val d = items.getOrNull(pos) ?: return@setOnItemClickListener
+            Prefs.addBind(evName(d.type, d.code), d.dev, d.type, d.code)
+            dlg.dismiss()
+        }
+        dlg.setOnDismissListener {
+            open = false
+            Core.stopDetection()
+            refreshBinds()
+            refreshProfiles()
+        }
+        dlg.show()
+        dlg.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            items.clear()
+            adapter.clear()
+        }
+        h.postDelayed({
+            if (open) Core.startDetection { dev, type, code, value ->
                 if (open) {
-                    val now = android.os.SystemClock.uptimeMillis()
+                    val now = SystemClock.uptimeMillis()
                     if (items.isEmpty()) t0 = now
                     var d = items.firstOrNull { it.dev == dev && it.type == type && it.code == code }
                     if (d == null) {
@@ -299,31 +343,6 @@ class MainActivity : Activity() {
                     d.value = value
                     redraw()
                 }
-            }
-        }
-        list.setOnItemClickListener { _, _, pos, _ ->
-            val d = items.getOrNull(pos) ?: return@setOnItemClickListener
-            Prefs.trigDevice = d.dev
-            Prefs.trigType = d.type
-            Prefs.trigCode = d.code
-            dlg.dismiss()
-        }
-        dlg.setOnDismissListener {
-            open = false
-            Core.detectListener = null
-            Core.setDetection(false)
-            Core.pushAll()
-            refreshTrigger()
-        }
-        dlg.show()
-        dlg.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
-            items.clear()
-            adapter.clear()
-        }
-        h.postDelayed({
-            if (open) {
-                Core.detectListener = listener
-                Core.setDetection(true)
             }
         }, 400)
     }
@@ -342,17 +361,16 @@ class MainActivity : Activity() {
             .setTitle("Choisir une appli")
             .setItems(apps.map { it.second }.toTypedArray()) { _, i ->
                 val (pkg, label) = apps[i]
-                if (Prefs.profile(pkg) == null) Prefs.upsert(Profile(pkg, label, -1f, -1f))
+                Prefs.addApp(pkg, label)
                 refreshProfiles()
-                place(pkg)
             }
             .setNegativeButton("Annuler", null)
             .show()
     }
 
-    private fun place(pkg: String) {
+    private fun place(pkg: String, bindId: Int) {
         val w = ForegroundWatcher.instance ?: return toast("Active d'abord le service d'accessibilité (étape 2).")
-        w.showPicker(pkg)
+        w.showPicker(pkg, bindId)
         packageManager.getLaunchIntentForPackage(pkg)?.let {
             it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(it)
@@ -366,22 +384,54 @@ class MainActivity : Activity() {
             profilesBox.addView(text("Aucune appli pour l'instant.", grey, 13f))
             return
         }
+        val binds = Prefs.binds()
         for (p in list) {
-            val row = LinearLayout(this).apply {
+            val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(0, px(8), 0, px(4))
+                setPadding(0, px(10), 0, px(4))
             }
-            row.addView(text(p.label, Color.WHITE, 15f))
-            row.addView(text(if (p.hasPos) "Position définie ✓" else "Position à définir", if (p.hasPos) gold else grey, 12f))
-            val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            btns.addView(button("Placer le point") { place(p.pkg) }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = px(8) })
-            btns.addView(button("Retirer") {
-                Prefs.remove(p.pkg)
-                Core.refreshTarget()
+            box.addView(text(p.label, Color.WHITE, 16f).apply { setTypeface(typeface, Typeface.BOLD) })
+            if (binds.isEmpty()) box.addView(text("Ajoute d'abord une touche (carte 3).", grey, 12f))
+            for (b in binds) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                val placed = p.pos.containsKey(b.id)
+                val state = when {
+                    !b.enabled -> "décochée"
+                    placed -> "placée ✓"
+                    else -> "pas placée"
+                }
+                row.addView(text("${b.name} · $state", if (placed && b.enabled) gold else grey, 13f), LinearLayout.LayoutParams(0, -2, 1f))
+                row.addView(button(if (placed) "Déplacer" else "Placer") { place(p.pkg, b.id) })
+                box.addView(row)
+            }
+            box.addView(button("Retirer ${p.label}") {
+                Prefs.removeApp(p.pkg)
+                Core.update()
                 refreshProfiles()
-            }, LinearLayout.LayoutParams(0, -2, 1f))
-            row.addView(btns)
-            profilesBox.addView(row)
+            })
+            profilesBox.addView(box)
         }
+    }
+
+    // ---------- Association ----------
+
+    private fun startPairing() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+            toast("Autorise les notifications, puis retouche « Associer ».")
+            return
+        }
+        Core.startPairDiscovery()
+        PairNotif.show(this, "Ouvre Débogage sans fil → « Associer l'appareil avec un code d'association », puis reviens ici (glisse le volet) pour taper le code.")
+        AlertDialog.Builder(this)
+            .setTitle("Association")
+            .setMessage("1. Active « Débogage sans fil » (Wi-Fi allumé) et touche son texte.\n2. Touche « Associer l'appareil avec un code d'association ».\n3. Sans fermer cette fenêtre, descends le volet des notifications : dans celle de Déclic, touche « Entrer le code » et tape le code à 6 chiffres.")
+            .setPositiveButton("C'est parti") { _, _ -> openDevSettings() }
+            .show()
     }
 }

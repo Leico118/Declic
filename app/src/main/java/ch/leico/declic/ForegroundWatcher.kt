@@ -19,7 +19,7 @@ class ForegroundWatcher : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         Core.init(this)
-        Core.start()
+        Core.update()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -41,15 +41,15 @@ class ForegroundWatcher : AccessibilityService() {
             }
         }
 
-    fun showPicker(pkg: String) {
+    fun showPicker(pkg: String, bindId: Int) {
         picker?.close()
-        picker = Picker(this, pkg) { picker = null }.also { it.show() }
+        picker = Picker(this, pkg, bindId) { picker = null }.also { it.show() }
     }
 
     /** Bloque l'action d'origine de la touche (ex. volume) dans les applis où elle est remappée. */
     override fun onKeyEvent(event: KeyEvent?): Boolean {
         val e = event ?: return false
-        return Core.mappingActive && Prefs.trigType == 1 && e.scanCode == Prefs.trigCode
+        return e.scanCode in Core.activeKeys && Core.aliveFast()
     }
 
     override fun onInterrupt() {}

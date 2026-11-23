@@ -42,6 +42,15 @@ object PairNotif {
     }
 }
 
+/** Notification simple (ex. moteur impossible à démarrer). */
+fun PairNotif.info(ctx: Context, title: String, text: String) {
+    val nm = ctx.getSystemService(NotificationManager::class.java)
+    nm.createNotificationChannel(NotificationChannel("etat", "État de Déclic", NotificationManager.IMPORTANCE_DEFAULT))
+    val pi = PendingIntent.getActivity(ctx, 2, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+    nm.notify(8, Notification.Builder(ctx, "etat").setSmallIcon(R.drawable.ic_fg).setContentTitle(title)
+        .setContentText(text).setStyle(Notification.BigTextStyle().bigText(text)).setContentIntent(pi).setAutoCancel(true).build())
+}
+
 class PairReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val code = RemoteInput.getResultsFromIntent(intent)?.getCharSequence(PairNotif.KEY)?.toString() ?: return

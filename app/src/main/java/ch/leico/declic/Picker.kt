@@ -21,6 +21,7 @@ import android.widget.Toast
 class Picker(
     private val svc: ForegroundWatcher,
     private val pkg: String,
+    private val bindId: Int,
     private val onClosed: () -> Unit,
 ) {
     private val wm = svc.getSystemService(WindowManager::class.java)
@@ -48,10 +49,10 @@ class Picker(
 
     fun show() {
         Core.pickerOpen = true
-        Core.refreshTarget()
+        Core.update()
         val scr = Geo.screen(svc)
-        val p = Prefs.profile(pkg)
-        val (cx, cy) = if (p != null && p.hasPos) Geo.fromNatural(scr, p.fx, p.fy) else (scr.w / 2f) to (scr.h / 2f)
+        val pos = Prefs.profile(pkg)?.pos?.get(bindId)
+        val (cx, cy) = if (pos != null) Geo.fromNatural(scr, pos.first, pos.second) else (scr.w / 2f) to (scr.h / 2f)
 
         val d = DotView(svc)
         dotLp = lp(size, size).apply {
@@ -83,7 +84,7 @@ class Picker(
             }
         }
         val label = TextView(svc).apply {
-            text = "✥ Glisse le cercle\nsur le bouton du jeu"
+            text = "✥ ${Prefs.binds().firstOrNull { it.id == bindId }?.name ?: "Touche"}\nglisse le cercle sur le bouton"
             setTextColor(Color.WHITE)
             textSize = 13f
             setPadding(0, 0, (10 * dp).toInt(), 0)
@@ -136,7 +137,7 @@ class Picker(
         val cy = loc[1] + size / 2f
         val (fx, fy) = Geo.toNatural(Geo.screen(svc), cx, cy)
         val label = Prefs.profile(pkg)?.label ?: pkg
-        Prefs.upsert(Profile(pkg, label, fx, fy))
+        Prefs.setPos(pkg, bindId, fx, fy)
         Toast.makeText(svc, "Position enregistrée pour $label", Toast.LENGTH_SHORT).show()
         close()
     }
@@ -153,7 +154,7 @@ class Picker(
         dot = null
         bar = null
         Core.pickerOpen = false
-        Core.refreshTarget()
+        Core.update()
         onClosed()
     }
 

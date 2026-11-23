@@ -1,40 +1,51 @@
 package ch.leico.declic
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.Display
-import io.github.muntashirakon.adb.AdbStream
-import java.io.InputStream
-import java.io.OutputStream
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.RandomAccessFile
 import java.net.NetworkInterface
 import java.util.concurrent.Executors
 
-/** Démarre le moteur via le débogage sans fil et lui transmet les réglages. */
+/**
+ * Côté appli : lance le moteur (via le débogage sans fil, qui est ensuite coupé), lui écrit ses
+ * réglages dans un fichier et lit son état.
+ */
 object Core {
     lateinit var app: Context
     @Volatile var currentPkg: String? = null
     @Volatile var pickerOpen = false
-    @Volatile var running = false
+    @Volatile var testOpen = false
+    @Volatile var uiOpen = 0
+    @Volatile var detecting = false
     @Volatile var starting = false
-    @Volatile var status: String = "Arrêté"
-    @Volatile var engineInfo: String = ""
+    @Volatile var startMsg: String = ""
     @Volatile var detectListener: ((String, Int, Int, Int) -> Unit)? = null
     @Volatile var pairPort = 0
-    /** Vrai quand la touche est remappée dans l'appli au premier plan (sert à bloquer son action d'origine). */
-    @Volatile var mappingActive = false
-    @Volatile var testOpen = false
-    @Volatile var lastKeyAt = 0L
+    /** Touches remappées dans l'appli au premier plan (pour bloquer leur action d'origine). */
+    @Volatile var activeKeys: Set<Int> = emptySet()
 
-    private var stream: AdbStream? = null
-    @Volatile private var out: OutputStream? = null
     private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private var inited = false
     private var nsdListener: NsdManager.DiscoveryListener? = null
+    private var eventsPos = 0L
+    private var lastFailNotif = 0L
+
+    private val dir: File get() = app.getExternalFilesDir(null) ?: app.filesDir
+    private val cfgFile get() = File(dir, "config.json")
+    private val statusFile get() = File(dir, "status.txt")
+    private val eventsFile get() = File(dir, "events.txt")
 
     fun init(ctx: Context) {
         if (inited) return
@@ -45,134 +56,224 @@ object Core {
             override fun onDisplayAdded(displayId: Int) {}
             override fun onDisplayRemoved(displayId: Int) {}
             override fun onDisplayChanged(displayId: Int) {
-                if (displayId == Display.DEFAULT_DISPLAY) refreshTarget()
+                if (displayId == Display.DEFAULT_DISPLAY) update()
             }
         }, main)
     }
 
+    // ---------- État du moteur ----------
+
+    /** Le moteur tourne-t-il (état récent, même version) ? */
+    fun engineAlive(): Boolean = try {
+        val first = statusFile.bufferedReader().use { it.readLine() } ?: ""
+        val v = Regex("v=(\\d+)").find(first)?.groupValues?.get(1)?.toInt() ?: -1
+        val t = Regex("t=(\\d+)").find(first)?.groupValues?.get(1)?.toLong() ?: 0L
+        v == BuildConfig.VERSION_CODE && System.currentTimeMillis() - t < 4000
+    } catch (_: Throwable) {
+        false
+    }
+
+    private var aliveAt = 0L
+    private var aliveVal = false
+
+    /** Version rapide (mise en cache 1 s) pour les appuis de touches. */
+    fun aliveFast(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - aliveAt > 1000) {
+            aliveVal = engineAlive()
+            aliveAt = now
+        }
+        return aliveVal
+    }
+
+    fun engineText(): String = try {
+        statusFile.readText().substringAfter('\n')
+    } catch (_: Throwable) {
+        ""
+    }
+
+    fun canToggleDebug(): Boolean =
+        app.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED
+
+    // ---------- Réglages envoyés au moteur ----------
+
+    private fun screenOn(): Boolean = try {
+        app.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY).state == Display.STATE_ON
+    } catch (_: Throwable) {
+        true
+    }
+
+    /** Recalcule ce que le moteur doit faire et l'écrit. Démarre le moteur si besoin. */
+    fun update() {
+        val binds = JSONArray()
+        val keys = HashSet<Int>()
+        val on = Prefs.active && screenOn() && !pickerOpen
+        if (on && testOpen) {
+            val scr = Geo.screen(app)
+            val (fx, fy) = Geo.toNatural(scr, scr.w * 0.75f, scr.h * 0.5f)
+            for (b in Prefs.binds().filter { it.enabled }) {
+                binds.put(JSONObject().put("id", b.id).put("dev", b.dev).put("type", b.type).put("code", b.code).put("fx", fx.toDouble()).put("fy", fy.toDouble()))
+                if (b.type == 1) keys.add(b.code)
+            }
+        } else if (on) {
+            val pkg = currentPkg
+            if (pkg != null) for ((b, p) in Prefs.activeFor(pkg)) {
+                binds.put(JSONObject().put("id", b.id).put("dev", b.dev).put("type", b.type).put("code", b.code).put("fx", p.first.toDouble()).put("fy", p.second.toDouble()))
+                if (b.type == 1) keys.add(b.code)
+            }
+        }
+        activeKeys = keys
+        val needed = binds.length() > 0 || uiOpen > 0 || detecting
+        val anyEnabled = Prefs.binds().any { it.enabled } && Prefs.active
+        val cfg = JSONObject()
+            .put("v", BuildConfig.VERSION_CODE)
+            .put("stop", !anyEnabled && uiOpen == 0 && !detecting)
+            .put("mode", Prefs.injectMode)
+            .put("minHold", 70)
+            .put("detect", detecting)
+            .put("binds", binds)
+        writeConfig(cfg.toString())
+        if (needed && anyEnabled || uiOpen > 0) ensureEngine(binds.length() > 0)
+    }
+
+    private fun writeConfig(txt: String) {
+        try {
+            val tmp = File(dir, "config.tmp")
+            tmp.writeText(txt)
+            if (!tmp.renameTo(cfgFile)) cfgFile.writeText(txt)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun onForeground(pkg: String) {
+        if (pkg == currentPkg) return
+        currentPkg = pkg
+        update()
+    }
+
     // ---------- Démarrage du moteur ----------
 
-    fun start() {
-        if (running || starting) return
+    /**
+     * Lance le moteur s'il ne tourne pas : active le débogage sans fil si on en a le droit,
+     * s'y connecte, lance le moteur détaché, puis coupe le débogage sans fil.
+     */
+    fun ensureEngine(fromGame: Boolean = false) {
+        if (starting || engineAlive()) return
         starting = true
-        status = "Connexion…"
+        startMsg = "Démarrage du moteur…"
         io.execute {
+            var weEnabled = false
             try {
-                val m = AdbManager.get(app)
-                val apk = app.applicationInfo.sourceDir
-                val cmd = "shell:CLASSPATH=$apk exec app_process /system/bin ch.leico.declic.Engine"
-                val s = try {
-                    m.openStream(cmd)
-                } catch (_: Throwable) {
-                    val ok = try {
-                        m.connectTls(app, 8000)
-                    } catch (_: Throwable) {
-                        false
-                    }
-                    if (!ok) throw Exception("Connexion impossible. Le débogage sans fil est-il activé (Wi-Fi allumé) ? L'association a-t-elle été faite ?")
-                    m.openStream(cmd)
+                val cr = app.contentResolver
+                val wasOn = Settings.Global.getInt(cr, "adb_wifi_enabled", 0) == 1
+                if (!wasOn) {
+                    if (!canToggleDebug()) throw Exception("Le débogage sans fil est coupé. Active-le (Wi-Fi allumé), puis touche Démarrer : Déclic le coupera tout seul ensuite.")
+                    Settings.Global.putInt(cr, "adb_wifi_enabled", 1)
+                    weEnabled = true
+                    Thread.sleep(1500)
                 }
-                stream = s
-                out = s.openOutputStream()
-                running = true
-                status = "✓ Moteur démarré"
-                val input = s.openInputStream()
-                Thread({ readLoop(input) }, "declic-lecture").start()
-                pushAll()
+                val m = AdbManager.get(app)
+                try {
+                    m.disconnect()
+                } catch (_: Throwable) {
+                }
+                val ok = try {
+                    m.connectTls(app, 10000)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!ok) throw Exception("Connexion au débogage sans fil impossible. Es-tu connecté à un Wi-Fi ? L'association a-t-elle été faite ?")
+                val apk = app.applicationInfo.sourceDir
+                val pkg = app.packageName
+                val script = "pkill -x declic_moteur; pkill -f '[c]h[.]leico[.]declic[.]Engine'; " +
+                    "C=ch.leico.declic; CLASSPATH=$apk setsid app_process /system/bin --nice-name=declic_moteur \$C.Engine </dev/null >/dev/null 2>&1 & " +
+                    "pm grant $pkg android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1; echo GRANT=\$?; " +
+                    "(sleep 3; settings put global adb_wifi_enabled 0) </dev/null >/dev/null 2>&1 & " +
+                    "echo FIN"
+                val s = m.openStream("shell:$script")
+                val outTxt = StringBuilder()
+                try {
+                    s.openInputStream().bufferedReader().forEachLine {
+                        outTxt.append(it).append('\n')
+                    }
+                } catch (_: Throwable) {
+                }
+                try {
+                    m.disconnect()
+                } catch (_: Throwable) {
+                }
+                // on attend le premier « battement de cœur » du moteur
+                var alive = false
+                for (i in 0 until 30) {
+                    Thread.sleep(200)
+                    if (engineAlive()) {
+                        alive = true
+                        break
+                    }
+                }
+                val grant = if (outTxt.contains("GRANT=0") || canToggleDebug()) "activation automatique du débogage autorisée ✓"
+                else "activation automatique refusée par le téléphone (il faudra activer le débogage sans fil à la main après un redémarrage)"
+                startMsg = if (alive) "✓ Moteur lancé, débogage sans fil coupé · $grant"
+                else "✗ Le moteur ne répond pas. Réponse du système : ${outTxt.toString().trim().take(200)}"
+                main.post { update() }
             } catch (e: Throwable) {
-                running = false
-                status = "✗ " + (e.message ?: e.toString())
+                startMsg = "✗ " + (e.message ?: e.toString())
+                if (weEnabled) try {
+                    Settings.Global.putInt(app.contentResolver, "adb_wifi_enabled", 0)
+                } catch (_: Throwable) {
+                }
+                if (fromGame && System.currentTimeMillis() - lastFailNotif > 60_000) {
+                    lastFailNotif = System.currentTimeMillis()
+                    PairNotif.info(app, "Déclic n'a pas pu démarrer son moteur", startMsg.removePrefix("✗ "))
+                }
             } finally {
                 starting = false
             }
         }
     }
 
-    private fun readLoop(input: InputStream) {
-        try {
-            input.bufferedReader().forEachLine { onLine(it) }
-        } catch (_: Throwable) {
-        }
-        running = false
-        mappingActive = false
-        out = null
-        stream = null
-        if (!status.startsWith("✗")) status = "✗ Moteur arrêté (touche Démarrer)"
+    /** Arrête le moteur (il lit « stop » dans ses réglages). */
+    fun stopEngine() {
+        writeConfig(JSONObject().put("v", BuildConfig.VERSION_CODE).put("stop", true).toString())
     }
 
-    private fun onLine(line: String) {
-        if (line.isEmpty()) return
-        when {
-            line.startsWith("E ") -> {
-                val p = line.split(" ", limit = 5)
-                if (p.size >= 4) {
-                    detectListener?.invoke(p.getOrElse(4) { "?" }, p[1].toInt(), p[2].toInt(), p[3].toInt())
+    // ---------- Détection des touches ----------
+
+    fun startDetection(listener: (String, Int, Int, Int) -> Unit) {
+        detectListener = listener
+        detecting = true
+        eventsPos = 0L
+        update()
+        pollEvents()
+    }
+
+    fun stopDetection() {
+        detecting = false
+        detectListener = null
+        update()
+    }
+
+    private fun pollEvents() {
+        if (!detecting) return
+        try {
+            val f = eventsFile
+            if (f.exists()) {
+                if (f.length() < eventsPos) eventsPos = 0L
+                RandomAccessFile(f, "r").use { raf ->
+                    raf.seek(eventsPos)
+                    while (true) {
+                        val line = raf.readLine() ?: break
+                        val p = line.split(" ", limit = 4)
+                        if (p.size >= 3) {
+                            detectListener?.invoke(p.getOrElse(3) { "?" }, p[0].toInt(), p[1].toInt(), p[2].toInt())
+                        }
+                    }
+                    eventsPos = raf.filePointer
                 }
             }
-            line.startsWith("K ") -> lastKeyAt = line.substring(2).trim().toLongOrNull() ?: 0L
-            line.startsWith("S ") -> engineInfo = line.substring(2).replace(" ⏎ ", "\n")
-            line == "R" -> status = "✓ Moteur démarré"
-            else -> engineInfo = "Message du système : $line"
-        }
-    }
-
-    fun send(line: String) {
-        io.execute {
-            val o = out ?: return@execute
-            try {
-                o.write((line + "\n").toByteArray())
-                o.flush()
-            } catch (_: Throwable) {
-                running = false
-                out = null
-            }
-        }
-    }
-
-    fun pushAll() {
-        send("M ${Prefs.injectMode}")
-        send("H 70")
-        val dev = Prefs.trigDevice
-        if (!dev.isNullOrEmpty()) send("T ${Prefs.trigType} ${Prefs.trigCode} $dev")
-        refreshTarget()
-    }
-
-    fun setDetection(on: Boolean) = send(if (on) "D 1" else "D 0")
-
-    fun onForeground(pkg: String) {
-        if (pkg == currentPkg) return
-        currentPkg = pkg
-        refreshTarget()
-    }
-
-    /** Envoie au moteur la position à toucher pour l'appli au premier plan (ou désactive). */
-    fun refreshTarget() {
-        if (!running) {
-            mappingActive = false
-            return
-        }
-        val pkg = currentPkg
-        val screenOn = try {
-            app.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY).state == Display.STATE_ON
         } catch (_: Throwable) {
-            true
         }
-        val p = if (Prefs.active && !pickerOpen && screenOn && pkg != null) Prefs.profile(pkg) else null
-        if (testOpen && screenOn) {
-            val scr = Geo.screen(app)
-            send("G ${scr.w} ${scr.h} ${scr.rot}")
-            send("P 1 ${scr.w * 0.75f} ${scr.h * 0.5f}")
-            mappingActive = true
-        } else if (p != null && p.hasPos) {
-            val scr = Geo.screen(app)
-            val (x, y) = Geo.fromNatural(scr, p.fx, p.fy)
-            send("G ${scr.w} ${scr.h} ${scr.rot}")
-            send("P 1 $x $y")
-            mappingActive = true
-        } else {
-            send("P 0 0 0")
-            mappingActive = false
-        }
+        main.postDelayed({ pollEvents() }, 80)
     }
 
     // ---------- Association (une seule fois) ----------
@@ -239,11 +340,9 @@ object Core {
             try {
                 val port = pairPort
                 if (port == 0) throw Exception("Fenêtre d'association pas détectée. Ouvre « Associer l'appareil avec un code d'association », puis réessaie.")
-                val ok = AdbManager.get(app).pair("127.0.0.1", port, code.trim())
-                if (!ok) throw Exception("Code refusé, réessaie avec un nouveau code.")
+                AdbManager.get(app).pair("127.0.0.1", port, code.trim())
                 stopPairDiscovery()
-                PairNotif.show(app, "Association réussie ✓ Tu peux revenir dans Déclic.", withInput = false)
-                main.post { start() }
+                PairNotif.show(app, "Association réussie ✓ Reviens dans Déclic et touche « Démarrer ».", withInput = false)
             } catch (e: Throwable) {
                 PairNotif.show(app, "Échec : ${e.message ?: e}")
             }

@@ -9,10 +9,12 @@ import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
+import org.json.JSONObject
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.io.File
 import java.io.FileDescriptor
 import java.io.FileInputStream
+import java.io.FileWriter
 import java.lang.reflect.Method
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -21,57 +23,75 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * Le « moteur » : lancé par Déclic via le débogage sans fil, avec les droits de l'ADB (shell).
+ * Le « moteur » de Déclic. Lancé une fois via le débogage sans fil (droits ADB/shell), puis
+ * détaché : il continue de tourner seul même quand le débogage sans fil est coupé.
+ * Il lit ses réglages dans un fichier écrit par l'appli et y écrit son état.
  *  - lit directement les événements bruts du noyau (/dev/input/eventX) -> aucune attente ;
- *  - mode « fusion » (par défaut) : dans les applis choisies, il prend la main sur l'écran tactile
- *    et renvoie tes vrais doigts + le doigt virtuel de la touche dans un seul flux multi-touch,
- *    pour que l'appui de la touche n'annule pas ton pouce ;
+ *  - mode « fusion » : dans les applis choisies, prend la main sur l'écran tactile et renvoie
+ *    tes vrais doigts + les doigts des touches dans un seul flux multi-touch ;
  *  - mode « simple » : doigt virtuel séparé (peut annuler les autres doigts).
- * Dialogue avec l'appli par lignes de texte (entrée/sortie standard).
  */
 object Engine {
 
-    private const val VIRTUAL_KEY = 100 // clé interne du doigt de la touche (son numéro Android est attribué librement)
+    private const val DIR = "/sdcard/Android/data/ch.leico.declic/files"
     private const val MAX_SLOTS = 16
     private const val EVIOCGRAB = 0x40044590
 
+    private val cfgFile = File(DIR, "config.json")
+    private val statusFile = File(DIR, "status.txt")
+    private val eventsFile = File(DIR, "events.txt")
+
+    /** Une touche active dans l'appli au premier plan. */
+    private class Bind(val id: Int, val dev: String, val type: Int, val code: Int, val fx: Float, val fy: Float) {
+        var rawDown = false
+        var rawAt = 0L
+        var gen = 0
+        var vDown = false
+        var sDown = 0L
+        var x = 0f
+        var y = 0f
+        val key get() = 100 + id
+    }
+
+    @Volatile private var binds: List<Bind> = emptyList()
     @Volatile private var enabled = false
-    @Volatile private var tx = 0f
-    @Volatile private var ty = 0f
-    @Volatile private var trigDev = ""
-    @Volatile private var trigType = -1
-    @Volatile private var trigCode = -1
     @Volatile private var injectMode = 0
+    @Volatile private var minHoldMs = 70L
     @Volatile private var detecting = false
     @Volatile private var lastErr = ""
     @Volatile private var injectCount = 0
     @Volatile private var triggerCount = 0
+    @Volatile private var lastDur = -1L
     @Volatile private var curW = 1080
     @Volatile private var curH = 2400
     @Volatile private var rot = 0
+    @Volatile private var displayErr = ""
+    @Volatile private var keyGrabInfo = "—"
+    @Volatile private var lastCfg = ""
 
     private val readers = HashMap<String, Reader>()
     private val lastSent = ConcurrentHashMap<String, Long>()
     private val readersLock = Any()
     private val stateLock = Any()
-    private val out = System.out
-
     private val evSize = if (Process.is64Bit()) 24 else 16
     private var injector: Injector? = null
+    private val sched = Executors.newSingleThreadScheduledExecutor()
+    private var eventsOut: FileWriter? = null
 
-    // État du flux tactile envoyé au système
+    // Flux tactile envoyé au système
     private class Ptr(val key: Int, val id: Int, var x: Float, var y: Float)
     private val ptrs = ArrayList<Ptr>()
     private var downTime = 0L
 
-    // Mode simple
-    private var simplePressed = false
-    private var simpleDown = 0L
-
     // Couche « fusion »
     @Volatile private var touchReader: Reader? = null
     @Volatile private var layerActive = false
+    @Volatile private var layerInfo = "inactive"
+    @Volatile private var grabErr = ""
+    @Volatile private var frames = 0
+    @Volatile private var sent = 0
     private var touchDevId = 0
+    private var tsCache: Pair<String, String>? = null
     private var minX = 0
     private var maxX = 1
     private var minY = 0
@@ -80,22 +100,6 @@ object Engine {
     private val slotTrack = IntArray(MAX_SLOTS) { -1 }
     private val slotX = IntArray(MAX_SLOTS)
     private val slotY = IntArray(MAX_SLOTS)
-    private var virtualDown = false
-    @Volatile private var layerInfo = "pas encore lancée"
-    @Volatile private var grabErr = ""
-    @Volatile private var keyGrabInfo = "touche non réservée"
-    private val powerCache = HashMap<String, Boolean>()
-    // Durée minimale d'un appui : certains boutons (Quick Button) envoient « enfoncé » et
-    // « relâché » au même instant, trop vite pour que le jeu le voie.
-    @Volatile private var minHoldMs = 70L
-    private val sched = Executors.newSingleThreadScheduledExecutor()
-    private var rawDown = false
-    private var rawAt = 0L
-    private var pressGen = 0
-    @Volatile private var lastDur = -1L
-    @Volatile private var frames = 0
-    @Volatile private var sent = 0
-    @Volatile private var refused = 0
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -113,97 +117,155 @@ object Engine {
             lastErr = "injecteur : $e"
             null
         }
-        emit("R")
-        val br = System.`in`.bufferedReader()
-        while (true) {
-            val line = try {
-                br.readLine()
-            } catch (_: Throwable) {
-                null
-            } ?: break
-            try {
-                handle(line.trim())
-            } catch (e: Throwable) {
-                lastErr = "commande « $line » : $e"
-            }
-        }
-        stopLayer()
-        System.exit(0) // l'appli s'est fermée : on s'arrête aussi (et on rend l'écran au système)
-    }
-
-    private fun emit(s: String) {
-        synchronized(out) {
-            out.print(s.replace("\n", " ⏎ "))
-            out.print('\n')
-            out.flush()
-        }
-    }
-
-    private fun handle(line: String) {
-        if (line.isEmpty()) return
-        when (line[0]) {
-            'T' -> {
-                val p = line.split(" ", limit = 4)
-                trigType = p[1].toInt()
-                trigCode = p[2].toInt()
-                trigDev = p.getOrElse(3) { "" }
-                updateReaders()
-            }
-            'G' -> if (!displayOk) {
-                val p = line.split(" ")
-                curW = p[1].toInt()
-                curH = p[2].toInt()
-                rot = p[3].toInt()
-            }
-            'P' -> {
-                val p = line.split(" ")
-                setTarget(p[1] == "1", p[2].toFloat(), p[3].toFloat())
-            }
-            'M' -> {
-                val m = line.substring(2).trim().toInt()
-                if (m != injectMode) {
-                    stopLayer()
-                    injectMode = m
-                    if (enabled) startLayer()
+        refreshDisplay()
+        // État écrit chaque seconde (sert aussi de « battement de cœur » pour l'appli)
+        Thread({
+            while (true) {
+                writeStatus()
+                try {
+                    Thread.sleep(1000)
+                } catch (_: InterruptedException) {
                 }
             }
-            'D' -> {
-                detecting = line.endsWith("1")
-                lastSent.clear()
-                updateReaders()
+        }, "declic-etat").apply { isDaemon = true }.start()
+        // Lecture des réglages
+        while (true) {
+            try {
+                val txt = if (cfgFile.exists()) cfgFile.readText() else ""
+                if (txt.isNotEmpty() && txt != lastCfg) {
+                    lastCfg = txt
+                    applyConfig(JSONObject(txt))
+                }
+            } catch (e: Throwable) {
+                lastErr = "réglages : $e"
             }
-            'H' -> minHoldMs = line.substring(2).trim().toLong()
-            'Q' -> emit("S " + status())
+            try {
+                Thread.sleep(100)
+            } catch (_: InterruptedException) {
+            }
         }
     }
 
-    private fun status(): String {
-        val n = synchronized(readersLock) { readers.size }
-        val sb = StringBuilder("uid ${Process.myUid()} · $n périph. · touche ×$triggerCount · appuis ×$injectCount")
-        if (enabled) sb.append(if (layerActive) " · prêt (fusion multi-touch)" else " · prêt (simple)")
-        sb.append(" · ").append(keyGrabInfo)
-        sb.append(" · dernier appui réel ${if (lastDur < 0) "—" else "$lastDur ms"} (min. $minHoldMs ms)")
-        sb.append("\n[Fusion] ").append(layerInfo).append(" · écran ${curW}x$curH rot $rot")
-        if (displayErr.isNotEmpty()) sb.append(" · ").append(displayErr)
-            .append(" · trames écran ×$frames · envoyés ×$sent · refusés ×$refused")
-        if (lastErr.isNotEmpty()) sb.append("\nDernière erreur : ").append(lastErr)
-        return sb.toString()
+    private fun quit() {
+        stopLayer()
+        synchronized(readersLock) {
+            for (r in readers.values) r.shutdown()
+            readers.clear()
+        }
+        try {
+            statusFile.writeText("v=0 t=0\nMoteur arrêté")
+        } catch (_: Throwable) {
+        }
+        System.exit(0)
     }
 
-    private fun setTarget(en: Boolean, x: Float, y: Float) {
+    private fun applyConfig(c: JSONObject) {
+        if (c.optBoolean("stop", false)) quit()
+        if (c.optInt("v", -1) != BuildConfig.VERSION_CODE) quit() // appli mise à jour : on laisse la place au nouveau moteur
+        val m = c.optInt("mode", 0)
+        minHoldMs = c.optLong("minHold", 70)
+        val det = c.optBoolean("detect", false)
+        if (det && !detecting) {
+            try {
+                eventsOut?.close()
+                eventsOut = FileWriter(eventsFile, false)
+            } catch (e: Throwable) {
+                lastErr = "fichier de détection : $e"
+            }
+            lastSent.clear()
+        }
+        detecting = det
+        val list = ArrayList<Bind>()
+        val arr = c.optJSONArray("binds")
+        if (arr != null) for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            list.add(Bind(o.getInt("id"), o.getString("dev"), o.getInt("type"), o.getInt("code"), o.getDouble("fx").toFloat(), o.getDouble("fy").toFloat()))
+        }
         synchronized(stateLock) {
-            tx = x
-            ty = y
+            // on garde l'état des touches déjà enfoncées
+            for (b in list) binds.firstOrNull { it.id == b.id }?.let { old ->
+                b.rawDown = old.rawDown; b.rawAt = old.rawAt; b.gen = old.gen; b.vDown = old.vDown; b.sDown = old.sDown; b.x = old.x; b.y = old.y
+            }
+            for (old in binds) if (list.none { it.id == old.id } && old.vDown) virtualUp(old)
+            binds = list
+        }
+        val en = list.isNotEmpty()
+        if (m != injectMode) {
+            stopLayer()
+            injectMode = m
         }
         if (en && !enabled) {
             enabled = true
             startLayer()
-            updateReaders()
         } else if (!en && enabled) {
             enabled = false
             stopLayer()
-            synchronized(stateLock) { if (simplePressed) simpleRelease() }
-            updateReaders()
+        } else if (en && touchReader == null) {
+            startLayer()
+        }
+        updateReaders()
+    }
+
+    private fun writeStatus() {
+        try {
+            val n = synchronized(readersLock) { readers.size }
+            val sb = StringBuilder("v=${BuildConfig.VERSION_CODE} t=${System.currentTimeMillis()}\n")
+            sb.append("✓ Moteur actif (uid ${Process.myUid()}) · $n périph. · touches ×$triggerCount · appuis ×$injectCount")
+            sb.append(if (enabled) (if (layerActive) " · prêt (fusion)" else " · prêt (simple)") else " · en veille")
+            sb.append("\n").append(keyGrabInfo).append(" · dernier appui réel ${if (lastDur < 0) "—" else "$lastDur ms"}")
+            sb.append("\n[Fusion] ").append(layerInfo).append(" · écran ${curW}x$curH rot $rot · trames ×$frames · envoyés ×$sent")
+            if (displayErr.isNotEmpty()) sb.append("\n").append(displayErr)
+            if (lastErr.isNotEmpty()) sb.append("\nDernière erreur : ").append(lastErr)
+            val tmp = File(DIR, "status.tmp")
+            tmp.writeText(sb.toString())
+            if (!tmp.renameTo(statusFile)) statusFile.writeText(sb.toString())
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun emitEvent(dev: String, type: Int, code: Int, value: Int) {
+        try {
+            val w = eventsOut ?: return
+            synchronized(w) {
+                w.write("$type $code $value $dev\n")
+                w.flush()
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    // ---------- Écran (taille, rotation) ----------
+
+    private fun refreshDisplay() {
+        try {
+            val dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
+            val inst = dmg.getMethod("getInstance").invoke(null)
+            val info = dmg.getMethod("getDisplayInfo", Int::class.javaPrimitiveType).invoke(inst, 0) ?: return
+            val c = info.javaClass
+            val w = c.getField("logicalWidth").getInt(info)
+            val h = c.getField("logicalHeight").getInt(info)
+            val r = c.getField("rotation").getInt(info)
+            if (w > 0 && h > 0) {
+                curW = w
+                curH = h
+                rot = r
+            }
+        } catch (e: Throwable) {
+            displayErr = "lecture rotation : ${e.cause ?: e}"
+        }
+    }
+
+    /** Fractions dans l'orientation naturelle -> point de l'écran actuel. */
+    private fun fromNatural(fx: Float, fy: Float): Pair<Float, Float> {
+        val nw = (if (rot % 2 == 0) curW else curH).toFloat()
+        val nh = (if (rot % 2 == 0) curH else curW).toFloat()
+        val X = fx * nw
+        val Y = fy * nh
+        return when (rot) {
+            1 -> Y to (nw - X)
+            2 -> (nw - X) to (nh - Y)
+            3 -> (nh - Y) to X
+            else -> X to Y
         }
     }
 
@@ -225,30 +287,25 @@ object Engine {
         }
     }
 
-    /** Le périphérique contient-il le bouton marche/arrêt ? Dans ce cas on ne le réserve jamais. */
-    private fun hasPowerKey(path: String): Boolean = powerCache.getOrPut(path) {
-        val txt = getevent(path)
-        val keys = Regex("KEY \\(0001\\):([\\s\\S]*?)(?:\\n\\s*[A-Z]{2,} \\(|$)").find(txt)?.groupValues?.get(1) ?: txt
-        keys.contains(Regex("\\b0074\\b"))
-    }
-
     private fun updateReaders() {
         synchronized(readersLock) {
-            val wanted = listDevices().filter { (_, name) -> detecting || (trigDev.isNotEmpty() && name == trigDev) }.toMap()
-            val grabKey = enabled && !detecting && trigType == 1
+            val active = binds
+            val trigDevs = active.map { it.dev }.toSet()
+            val wanted = listDevices().filter { (_, name) -> detecting || name in trigDevs }.toMap()
+            val grabOk = enabled && !detecting
             val it = readers.entries.iterator()
             while (it.hasNext()) {
                 val e = it.next()
-                val wantGrab = grabKey && wanted[e.key] == trigDev
+                val wantGrab = grabOk && wanted[e.key]?.let { it in trigDevs } == true
                 if (!wanted.containsKey(e.key) || !e.value.isAlive || e.value.grab != wantGrab) {
                     e.value.shutdown()
                     it.remove()
                 }
             }
-            if (!grabKey) keyGrabInfo = "touche non réservée"
+            if (!grabOk) keyGrabInfo = "touches non réservées"
             for ((path, name) in wanted) {
                 if (!readers.containsKey(path)) {
-                    val wantGrab = grabKey && name == trigDev
+                    val wantGrab = grabOk && name in trigDevs
                     val r = Reader(path, wantGrab, false) { t, c, v -> onRawEvent(name, t, c, v, wantGrab) }
                     readers[path] = r
                     r.start()
@@ -265,7 +322,6 @@ object Engine {
     ) : Thread("declic-${path.substringAfterLast('/')}") {
         @Volatile var stopped = false
         @Volatile var stream: FileInputStream? = null
-        @Volatile var grabFailed = false
 
         override fun run() {
             try {
@@ -281,14 +337,13 @@ object Engine {
                     val ok = grabDevice(s.fd)
                     if (required) {
                         if (!ok) {
-                            grabFailed = true
-                            layerInfo = layerInfo.replace("prise en main…", "prise en main ÉCHEC ($grabErr) → mode simple")
-                            onGrabFailed()
+                            layerInfo = "prise en main ÉCHEC ($grabErr) → mode simple"
+                            onLayerDied()
                             return
                         }
                         layerInfo = layerInfo.replace("prise en main…", "prise en main OK")
                     } else {
-                        keyGrabInfo = if (ok) "touche réservée à Déclic ✓" else "réservation de la touche impossible ($grabErr)"
+                        keyGrabInfo = if (ok) "touches réservées à Déclic ✓" else "réservation des touches impossible ($grabErr)"
                     }
                 }
                 var pending = 0
@@ -311,7 +366,7 @@ object Engine {
                 if (!stopped) lastErr = "lecture $path : ${e.message}"
             } finally {
                 try {
-                    stream?.close() // fermer = rendre l'écran au système
+                    stream?.close() // fermer = rendre le périphérique au système
                 } catch (_: Throwable) {
                 }
                 if (grab && required && !stopped) onLayerDied()
@@ -328,7 +383,7 @@ object Engine {
         }
     }
 
-    /** EVIOCGRAB : l'écran tactile n'envoie plus rien au système, seulement à Déclic. */
+    /** EVIOCGRAB : le périphérique n'envoie plus rien au système, seulement à Déclic. */
     private fun grabDevice(fd: FileDescriptor): Boolean {
         val candidates = ArrayList<Pair<Any?, Method>>()
         try {
@@ -364,17 +419,18 @@ object Engine {
         return false
     }
 
-    private fun onRawEvent(dev: String, type: Int, code: Int, value: Int, grabbed: Boolean = false) {
+    private fun onRawEvent(dev: String, type: Int, code: Int, value: Int, grabbed: Boolean) {
         if (type == 0) return // EV_SYN
-        // Composant réservé : on renvoie au système les autres boutons (marche/arrêt, volume…)
-        if (grabbed && type == 1 && !(code == trigCode && trigType == 1)) forwardKey(code, value)
-        if (type == trigType && code == trigCode && dev == trigDev) {
-            if (value != 0) {
-                triggerCount++
-                if (!detecting) emit("K ${SystemClock.uptimeMillis()}")
+        var matched = false
+        for (b in binds) {
+            if (b.type == type && b.code == code && b.dev == dev) {
+                matched = true
+                if (value != 0) triggerCount++
+                handleTrigger(b, value != 0)
             }
-            handleTrigger(value != 0)
         }
+        // Composant réservé : on renvoie au système les autres boutons (marche/arrêt, volume…)
+        if (grabbed && type == 1 && !matched) forwardKey(code, value)
         if (detecting) {
             if (type != 1) { // hors touches : on limite le débit
                 val key = "$dev|$type|$code"
@@ -383,7 +439,32 @@ object Engine {
                 if (now - last < 250) return
                 lastSent[key] = now
             }
-            emit("E $type $code $value $dev")
+            emitEvent(dev, type, code, value)
+        }
+    }
+
+    private val keyDownAt = HashMap<Int, Long>()
+
+    private fun forwardKey(code: Int, value: Int) {
+        val kc = when (code) {
+            116 -> KeyEvent.KEYCODE_POWER
+            115 -> KeyEvent.KEYCODE_VOLUME_UP
+            114 -> KeyEvent.KEYCODE_VOLUME_DOWN
+            113 -> KeyEvent.KEYCODE_VOLUME_MUTE
+            212 -> KeyEvent.KEYCODE_CAMERA
+            528 -> KeyEvent.KEYCODE_FOCUS
+            else -> return
+        }
+        val inj = injector ?: return
+        try {
+            val now = SystemClock.uptimeMillis()
+            val action = if (value == 0) KeyEvent.ACTION_UP else KeyEvent.ACTION_DOWN
+            if (value == 1) keyDownAt[code] = now
+            val down = keyDownAt[code] ?: now
+            val ev = KeyEvent(down, now, action, kc, if (value == 2) 1 else 0, 0, -1, code, 0, InputDevice.SOURCE_KEYBOARD)
+            inj.inject(ev)
+        } catch (e: Throwable) {
+            lastErr = "renvoi bouton $code : ${e.cause ?: e}"
         }
     }
 
@@ -396,46 +477,18 @@ object Engine {
             layerInfo = "écran tactile introuvable → mode simple"
             return
         }
-        layerInfo = "écran « ${ts.second} » (${ts.first.substringAfterLast('/')}) X $minX..$maxX Y $minY..$maxY id $touchDevId · ${curW}x$curH rot $rot · prise en main…"
+        layerInfo = "écran ${ts.first.substringAfterLast('/')} · prise en main…"
         synchronized(stateLock) {
             for (i in 0 until MAX_SLOTS) slotTrack[i] = -1
             curSlot = 0
             ptrs.clear()
-            virtualDown = false
+            for (b in binds) b.vDown = false
             layerActive = true
         }
         refreshDisplay()
         val r = Reader(ts.first, true) { t, c, v -> onTouch(t, c, v) }
         touchReader = r
         r.start()
-        startDisplayPoll()
-    }
-
-    /** Lit la taille et la rotation réelles de l'écran (ne dépend plus de l'appli). */
-    private fun refreshDisplay() {
-        try {
-            val dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
-            val inst = dmg.getMethod("getInstance").invoke(null)
-            val info = dmg.getMethod("getDisplayInfo", Int::class.javaPrimitiveType).invoke(inst, 0) ?: return
-            val c = info.javaClass
-            val w = c.getField("logicalWidth").getInt(info)
-            val hh = c.getField("logicalHeight").getInt(info)
-            val r = c.getField("rotation").getInt(info)
-            if (w > 0 && hh > 0) {
-                displayOk = true
-                curW = w
-                curH = hh
-                rot = r
-            }
-        } catch (e: Throwable) {
-            displayErr = "lecture rotation : ${e.cause ?: e}"
-        }
-    }
-
-    @Volatile private var displayErr = ""
-    @Volatile private var displayOk = false
-
-    private fun startDisplayPoll() {
         Thread({
             while (layerActive) {
                 refreshDisplay()
@@ -456,14 +509,7 @@ object Engine {
             releaseAll()
         }
         r.shutdown()
-    }
-
-    private fun onGrabFailed() {
-        synchronized(stateLock) {
-            layerActive = false
-            ptrs.clear()
-        }
-        touchReader = null
+        layerInfo = "inactive"
     }
 
     private fun onLayerDied() {
@@ -473,9 +519,6 @@ object Engine {
         }
         touchReader = null
     }
-
-    /** Choisit le vrai écran tactile : celui qui a la plus grande surface multi-touch. Remplit minX… */
-    private var tsCache: Pair<String, String>? = null
 
     private fun findTouchscreen(): Pair<String, String>? {
         tsCache?.let { return it }
@@ -493,7 +536,7 @@ object Engine {
         for (dev in listDevices()) {
             val r = ranges(dev.first) ?: continue
             var area = (r[1] - r[0]).toLong() * (r[3] - r[2]).toLong()
-            if (tsNames.containsKey(dev.second)) area *= 4 // priorité aux écrans connus d'Android
+            if (tsNames.containsKey(dev.second)) area *= 4
             if (area > bestArea) {
                 bestArea = area
                 best = dev
@@ -529,26 +572,16 @@ object Engine {
     }
 
     /** Position brute de l'écran tactile -> coordonnées de l'écran dans l'orientation actuelle. */
-    private fun map(rx: Int, ry: Int): Pair<Float, Float> {
-        val nw = (if (rot % 2 == 0) curW else curH).toFloat()
-        val nh = (if (rot % 2 == 0) curH else curW).toFloat()
-        val X = (rx - minX).toFloat() / (maxX - minX) * nw
-        val Y = (ry - minY).toFloat() / (maxY - minY) * nh
-        return when (rot) {
-            1 -> Y to (nw - X)
-            2 -> (nw - X) to (nh - Y)
-            3 -> (nh - Y) to X
-            else -> X to Y
-        }
-    }
+    private fun map(rx: Int, ry: Int): Pair<Float, Float> =
+        fromNatural((rx - minX).toFloat() / (maxX - minX), (ry - minY).toFloat() / (maxY - minY))
 
     private fun onTouch(type: Int, code: Int, value: Int) {
         synchronized(stateLock) {
             if (!layerActive) return
             if (type == 3) {
                 when (code) {
-                    0x2f -> curSlot = value.coerceIn(0, MAX_SLOTS - 1) // ABS_MT_SLOT
-                    0x39 -> slotTrack[curSlot] = if (value < 0) -1 else value // ABS_MT_TRACKING_ID
+                    0x2f -> curSlot = value.coerceIn(0, MAX_SLOTS - 1)
+                    0x39 -> slotTrack[curSlot] = if (value < 0) -1 else value
                     0x35 -> {
                         slotX[curSlot] = value
                         if (slotTrack[curSlot] < 0 && ptrIndex(curSlot) < 0) slotTrack[curSlot] = 0
@@ -567,7 +600,6 @@ object Engine {
         return -1
     }
 
-    /** Plus petit numéro de doigt libre, comme le fait Android (0, 1, 2…). */
     private fun freeId(): Int {
         var id = 0
         while (ptrs.any { it.id == id }) id++
@@ -576,7 +608,6 @@ object Engine {
 
     private fun commitFrame() {
         var moved = false
-        // 1) positions des doigts déjà posés
         for (s in 0 until MAX_SLOTS) {
             if (slotTrack[s] < 0) continue
             val i = ptrIndex(s)
@@ -591,14 +622,12 @@ object Engine {
             }
         }
         var emitted = false
-        // 2) doigts levés
         for (s in 0 until MAX_SLOTS) {
             if (slotTrack[s] < 0 && ptrIndex(s) >= 0) {
                 removePointer(s)
                 emitted = true
             }
         }
-        // 3) nouveaux doigts
         for (s in 0 until MAX_SLOTS) {
             if (slotTrack[s] >= 0 && ptrIndex(s) < 0) {
                 val (x, y) = map(slotX[s], slotY[s])
@@ -629,7 +658,7 @@ object Engine {
 
     private fun releaseAll() {
         while (ptrs.isNotEmpty()) removePointer(ptrs.last().key)
-        virtualDown = false
+        for (b in binds) b.vDown = false
     }
 
     private fun send(action: Int) {
@@ -654,108 +683,67 @@ object Engine {
                 downTime, SystemClock.uptimeMillis(), action, n, props, coords, 0, 0, 1f, 1f,
                 touchDevId, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
             )
-            val ok = inj.inject(ev)
+            inj.inject(ev)
             ev.recycle()
             sent++
-            if (!ok) {
-                refused++
-                lastErr = "appui refusé par le système (action $action)"
-            }
         } catch (e: Throwable) {
-            refused++
             lastErr = "appui : ${e.cause ?: e}"
         }
     }
 
-    // ---------- La touche ----------
+    // ---------- Les touches ----------
 
-    private fun handleTrigger(down: Boolean) {
+    private fun handleTrigger(b: Bind, down: Boolean) {
         synchronized(stateLock) {
             val now = SystemClock.uptimeMillis()
             if (down) {
-                if (rawDown) return // répétition automatique : on ignore
-                rawDown = true
-                rawAt = now
-                pressGen++
+                if (b.rawDown) return // répétition automatique
+                b.rawDown = true
+                b.rawAt = now
+                b.gen++
                 if (!enabled) return
-                if (isVirtualDown()) virtualUp() // relâchement encore en attente (double appui rapide)
-                virtualDownNow()
+                if (b.vDown) virtualUp(b) // relâchement encore en attente (appuis rapprochés)
+                virtualDown(b)
             } else {
-                if (!rawDown) return
-                rawDown = false
-                lastDur = now - rawAt
-                if (!isVirtualDown()) return
+                if (!b.rawDown) return
+                b.rawDown = false
+                lastDur = now - b.rawAt
+                if (!b.vDown) return
                 val wait = minHoldMs - lastDur
                 if (wait > 0) {
-                    val g = pressGen
+                    val g = b.gen
                     sched.schedule({
-                        synchronized(stateLock) { if (g == pressGen && !rawDown) virtualUp() }
+                        synchronized(stateLock) { if (g == b.gen && !b.rawDown) virtualUp(b) }
                     }, wait, TimeUnit.MILLISECONDS)
                 } else {
-                    virtualUp()
+                    virtualUp(b)
                 }
             }
         }
     }
 
-    private val keyDownAt = HashMap<Int, Long>()
-
-    /** Renvoie au système un bouton physique du composant réservé (code noyau -> touche Android). */
-    private fun forwardKey(code: Int, value: Int) {
-        val kc = when (code) {
-            116 -> KeyEvent.KEYCODE_POWER
-            115 -> KeyEvent.KEYCODE_VOLUME_UP
-            114 -> KeyEvent.KEYCODE_VOLUME_DOWN
-            113 -> KeyEvent.KEYCODE_VOLUME_MUTE
-            212 -> KeyEvent.KEYCODE_CAMERA
-            528 -> KeyEvent.KEYCODE_FOCUS
-            else -> return
-        }
-        val inj = injector ?: return
-        try {
-            val now = SystemClock.uptimeMillis()
-            val action = if (value == 0) KeyEvent.ACTION_UP else KeyEvent.ACTION_DOWN
-            if (value == 1) keyDownAt[code] = now
-            val down = keyDownAt[code] ?: now
-            val repeat = if (value == 2) 1 else 0
-            val ev = KeyEvent(down, now, action, kc, repeat, 0, -1, code, 0, InputDevice.SOURCE_KEYBOARD)
-            inj.inject(ev)
-        } catch (e: Throwable) {
-            lastErr = "renvoi bouton $code : ${e.cause ?: e}"
-        }
-    }
-
-    private fun isVirtualDown() = if (layerActive) virtualDown else simplePressed
-
-    private fun virtualDownNow() {
+    private fun virtualDown(b: Bind) {
+        if (!layerActive) refreshDisplay()
+        val (x, y) = fromNatural(b.fx, b.fy)
+        b.x = x
+        b.y = y
+        b.vDown = true
         if (layerActive) {
-            virtualDown = true
-            addPointer(VIRTUAL_KEY, tx, ty)
+            addPointer(b.key, x, y)
         } else {
-            simplePressed = true
-            simpleDown = SystemClock.uptimeMillis()
-            simpleInject(MotionEvent.ACTION_DOWN)
+            b.sDown = SystemClock.uptimeMillis()
+            simpleInject(b, MotionEvent.ACTION_DOWN)
         }
         injectCount++
     }
 
-    private fun virtualUp() {
-        if (layerActive) {
-            if (virtualDown) {
-                virtualDown = false
-                removePointer(VIRTUAL_KEY)
-            }
-        } else if (simplePressed) {
-            simpleRelease()
-        }
+    private fun virtualUp(b: Bind) {
+        if (!b.vDown) return
+        b.vDown = false
+        if (layerActive) removePointer(b.key) else simpleInject(b, MotionEvent.ACTION_UP)
     }
 
-    private fun simpleRelease() {
-        simplePressed = false
-        simpleInject(MotionEvent.ACTION_UP)
-    }
-
-    private fun simpleInject(action: Int) {
+    private fun simpleInject(b: Bind, action: Int) {
         val inj = injector ?: return
         try {
             val props = arrayOf(MotionEvent.PointerProperties().apply {
@@ -763,18 +751,17 @@ object Engine {
                 toolType = MotionEvent.TOOL_TYPE_FINGER
             })
             val coords = arrayOf(MotionEvent.PointerCoords().apply {
-                x = tx
-                y = ty
+                x = b.x
+                y = b.y
                 pressure = 1f
                 size = 0.05f
             })
             val ev = MotionEvent.obtain(
-                simpleDown, SystemClock.uptimeMillis(), action, 1, props, coords, 0, 0, 1f, 1f,
-                7777, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+                b.sDown, SystemClock.uptimeMillis(), action, 1, props, coords, 0, 0, 1f, 1f,
+                7777 + b.id, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
             )
-            val ok = inj.inject(ev)
+            inj.inject(ev)
             ev.recycle()
-            if (!ok) lastErr = "appui refusé par le système"
         } catch (e: Throwable) {
             lastErr = "appui : ${e.cause ?: e}"
         }
