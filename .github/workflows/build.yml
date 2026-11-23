@@ -1,0 +1,62 @@
+name: Compiler Declic
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+concurrency: { group: apk, cancel-in-progress: true }
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Extraire les sources
+        run: |
+          shopt -s nullglob
+          zips=(Declic*.zip)
+          if [ ${#zips[@]} -gt 0 ]; then
+            newest=""; best=-1
+            for z in "${zips[@]}"; do
+              t=$(git log -1 --format=%ct -- "$z"); t=${t:-0}
+              if [ "$t" -ge "$best" ]; then best=$t; newest="$z"; fi
+            done
+            echo "Archive utilisée : $newest"
+            unzip -o -q "$newest"
+            git rm -q -- "${zips[@]}"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A && git commit -q -m "Sources de Declic extraites ($newest)"
+            git pull -q --rebase && git push
+          fi
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.14.3 }
+      - name: Compiler
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" "build-tools;35.0.0" > /dev/null || true
+          base64 -d keystore/declic.jks.b64 > keystore/declic.jks
+          set -o pipefail
+          gradle :app:assembleDebug --no-daemon 2>&1 | tee build.log
+          V=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          echo "V=$V" >> "$GITHUB_ENV"
+          cp app/build/outputs/apk/debug/app-debug.apk "Declic-v$V.apk"
+      - uses: actions/upload-artifact@v4
+        with: { name: "Declic-v${{ env.V }}", path: "Declic-v${{ env.V }}.apk" }
+      - name: Publier
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release delete "v$V" --cleanup-tag -y || true
+          gh release create "v$V" "Declic-v$V.apk" --latest -t "Déclic $V" -n "Version $V (exécution ${{ github.run_number }})"
+      - name: Signaler un échec
+        if: failure()
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          touch build.log
+          (echo '```'; grep -E "^e: |error:|FAILED|What went wrong|Could not" build.log | head -60; echo '...'; tail -40 build.log; echo '```') > issue.md
+          gh issue create -t "Échec de compilation ${{ github.run_number }}" -F issue.md
