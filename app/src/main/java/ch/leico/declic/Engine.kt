@@ -366,7 +366,10 @@ object Engine {
     private fun onRawEvent(dev: String, type: Int, code: Int, value: Int) {
         if (type == 0) return // EV_SYN
         if (type == trigType && code == trigCode && dev == trigDev) {
-            if (value != 0) triggerCount++
+            if (value != 0) {
+                triggerCount++
+                if (!detecting) emit("K ${SystemClock.uptimeMillis()}")
+            }
             handleTrigger(value != 0)
         }
         if (detecting) {

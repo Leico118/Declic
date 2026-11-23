@@ -133,6 +133,9 @@ class MainActivity : Activity() {
             })
             profilesBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }.also { addView(it) }
             addView(button("+ Ajouter une appli") { addApp() })
+            addView(button("Zone de test (vérifier les doigts et le délai)") {
+                startActivity(Intent(this@MainActivity, TestActivity::class.java))
+            })
         }
 
         card("Réglage avancé · type d'appui").apply {

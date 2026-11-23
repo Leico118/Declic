@@ -26,6 +26,8 @@ object Core {
     @Volatile var pairPort = 0
     /** Vrai quand la touche est remappée dans l'appli au premier plan (sert à bloquer son action d'origine). */
     @Volatile var mappingActive = false
+    @Volatile var testOpen = false
+    @Volatile var lastKeyAt = 0L
 
     private var stream: AdbStream? = null
     @Volatile private var out: OutputStream? = null
@@ -107,6 +109,7 @@ object Core {
                     detectListener?.invoke(p.getOrElse(4) { "?" }, p[1].toInt(), p[2].toInt(), p[3].toInt())
                 }
             }
+            line.startsWith("K ") -> lastKeyAt = line.substring(2).trim().toLongOrNull() ?: 0L
             line.startsWith("S ") -> engineInfo = line.substring(2).replace(" ⏎ ", "\n")
             line == "R" -> status = "✓ Moteur démarré"
             else -> engineInfo = "Message du système : $line"
@@ -155,7 +158,12 @@ object Core {
             true
         }
         val p = if (Prefs.active && !pickerOpen && screenOn && pkg != null) Prefs.profile(pkg) else null
-        if (p != null && p.hasPos) {
+        if (testOpen && screenOn) {
+            val scr = Geo.screen(app)
+            send("G ${scr.w} ${scr.h} ${scr.rot}")
+            send("P 1 ${scr.w * 0.75f} ${scr.h * 0.5f}")
+            mappingActive = true
+        } else if (p != null && p.hasPos) {
             val scr = Geo.screen(app)
             val (x, y) = Geo.fromNatural(scr, p.fx, p.fy)
             send("G ${scr.w} ${scr.h} ${scr.rot}")

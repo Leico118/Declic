@@ -33,6 +33,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".TestActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:label="Zone de test" />
+
         <service
             android:name=".ForegroundWatcher"
             android:exported="false"
