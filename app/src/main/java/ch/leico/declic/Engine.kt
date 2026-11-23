@@ -16,6 +16,8 @@ import java.lang.reflect.Method
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Le « moteur » : lancé par Déclic via le débogage sans fil, avec les droits de l'ADB (shell).
@@ -79,6 +81,14 @@ object Engine {
     private val slotY = IntArray(MAX_SLOTS)
     private var virtualDown = false
     @Volatile private var layerInfo = "pas encore lancée"
+    // Durée minimale d'un appui : certains boutons (Quick Button) envoient « enfoncé » et
+    // « relâché » au même instant, trop vite pour que le jeu le voie.
+    @Volatile private var minHoldMs = 70L
+    private val sched = Executors.newSingleThreadScheduledExecutor()
+    private var rawDown = false
+    private var rawAt = 0L
+    private var pressGen = 0
+    @Volatile private var lastDur = -1L
     @Volatile private var frames = 0
     @Volatile private var sent = 0
     @Volatile private var refused = 0
@@ -158,6 +168,7 @@ object Engine {
                 lastSent.clear()
                 updateReaders()
             }
+            'H' -> minHoldMs = line.substring(2).trim().toLong()
             'Q' -> emit("S " + status())
         }
     }
@@ -166,6 +177,7 @@ object Engine {
         val n = synchronized(readersLock) { readers.size }
         val sb = StringBuilder("uid ${Process.myUid()} · $n périph. · touche ×$triggerCount · appuis ×$injectCount")
         if (enabled) sb.append(if (layerActive) " · prêt (fusion multi-touch)" else " · prêt (simple)")
+        sb.append(" · dernier appui réel ${if (lastDur < 0) "—" else "$lastDur ms"} (min. $minHoldMs ms)")
         sb.append("\n[Fusion] ").append(layerInfo)
             .append(" · trames écran ×$frames · envoyés ×$sent · refusés ×$refused")
         if (lastErr.isNotEmpty()) sb.append("\nDernière erreur : ").append(lastErr)
@@ -582,29 +594,55 @@ object Engine {
 
     private fun handleTrigger(down: Boolean) {
         synchronized(stateLock) {
-            if (!enabled) {
-                if (!down && simplePressed) simpleRelease()
-                return
-            }
-            if (layerActive) {
-                if (down && !virtualDown) {
-                    virtualDown = true
-                    addPointer(VIRTUAL_ID, tx, ty)
-                    injectCount++
-                } else if (!down && virtualDown) {
-                    virtualDown = false
-                    removePointer(VIRTUAL_ID)
-                }
+            val now = SystemClock.uptimeMillis()
+            if (down) {
+                if (rawDown) return // répétition automatique : on ignore
+                rawDown = true
+                rawAt = now
+                pressGen++
+                if (!enabled) return
+                if (isVirtualDown()) virtualUp() // relâchement encore en attente (double appui rapide)
+                virtualDownNow()
             } else {
-                if (down && !simplePressed) {
-                    simplePressed = true
-                    simpleDown = SystemClock.uptimeMillis()
-                    simpleInject(MotionEvent.ACTION_DOWN)
-                    injectCount++
-                } else if (!down && simplePressed) {
-                    simpleRelease()
+                if (!rawDown) return
+                rawDown = false
+                lastDur = now - rawAt
+                if (!isVirtualDown()) return
+                val wait = minHoldMs - lastDur
+                if (wait > 0) {
+                    val g = pressGen
+                    sched.schedule({
+                        synchronized(stateLock) { if (g == pressGen && !rawDown) virtualUp() }
+                    }, wait, TimeUnit.MILLISECONDS)
+                } else {
+                    virtualUp()
                 }
             }
+        }
+    }
+
+    private fun isVirtualDown() = if (layerActive) virtualDown else simplePressed
+
+    private fun virtualDownNow() {
+        if (layerActive) {
+            virtualDown = true
+            addPointer(VIRTUAL_ID, tx, ty)
+        } else {
+            simplePressed = true
+            simpleDown = SystemClock.uptimeMillis()
+            simpleInject(MotionEvent.ACTION_DOWN)
+        }
+        injectCount++
+    }
+
+    private fun virtualUp() {
+        if (layerActive) {
+            if (virtualDown) {
+                virtualDown = false
+                removePointer(VIRTUAL_ID)
+            }
+        } else if (simplePressed) {
+            simpleRelease()
         }
     }
 

@@ -128,6 +128,7 @@ object Core {
 
     fun pushAll() {
         send("M ${Prefs.injectMode}")
+        send("H 70")
         val dev = Prefs.trigDevice
         if (!dev.isNullOrEmpty()) send("T ${Prefs.trigType} ${Prefs.trigCode} $dev")
         refreshTarget()
