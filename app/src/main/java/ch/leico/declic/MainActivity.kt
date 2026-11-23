@@ -95,7 +95,7 @@ class MainActivity : Activity() {
         card("1 · Moteur").apply {
             tvEngine = text("", Color.WHITE, 13f).also { addView(it) }
             addView(button("Démarrer") { Core.ensureEngine() })
-            addView(text("Le moteur se lance via le débogage sans fil, puis Déclic coupe le débogage : le moteur continue tout seul (même sans Wi-Fi), jusqu'au prochain redémarrage du téléphone.\nUne seule fois : active les Options pour les développeurs, puis « Associer ».", grey, 12f))
+            addView(text("Le moteur se lance via le débogage sans fil, puis Déclic coupe le débogage : le moteur continue tout seul (même sans Wi-Fi), jusqu'au prochain redémarrage du téléphone.\nAprès un redémarrage : active le débogage sans fil (en Wi-Fi), Déclic s'occupe du reste, même sans l'ouvrir.\nAstuce : Options pour les développeurs → « Tuiles de développeur pour la configuration rapide » → active « Débogage sans fil », pour l'avoir dans le volet.", grey, 12f))
             addView(button("Associer (une seule fois)") { startPairing() })
             addView(button("Ouvrir les options pour les développeurs") { openDevSettings() })
         }
@@ -225,7 +225,7 @@ class MainActivity : Activity() {
         val sb = StringBuilder()
         sb.append(if (alive) Core.engineText() else if (Core.starting) "Démarrage du moteur…" else "✗ Moteur arrêté")
         if (Core.startMsg.isNotEmpty() && !Core.starting) sb.append("\n").append(Core.startMsg)
-        sb.append("\nActivation automatique du débogage : ").append(if (Core.canToggleDebug()) "✓ autorisée" else "pas encore (elle s'autorise au premier démarrage)")
+        if (Core.canToggleDebug()) sb.append("\nActivation automatique du débogage : ✓")
         tvEngine.text = sb.toString()
     }
 

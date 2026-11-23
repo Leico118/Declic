@@ -59,6 +59,20 @@ object Core {
                 if (displayId == Display.DEFAULT_DISPLAY) update()
             }
         }, main)
+        // Dès que le débogage sans fil est activé (ex. tuile des réglages rapides), on lance le moteur.
+        try {
+            app.contentResolver.registerContentObserver(
+                Settings.Global.getUriFor("adb_wifi_enabled"), false,
+                object : android.database.ContentObserver(main) {
+                    override fun onChange(selfChange: Boolean) {
+                        val on = Settings.Global.getInt(app.contentResolver, "adb_wifi_enabled", 0) == 1
+                        if (on && !engineAlive() && Prefs.binds().any { it.enabled } && Prefs.active) {
+                            main.postDelayed({ ensureEngine() }, 1500)
+                        }
+                    }
+                })
+        } catch (_: Throwable) {
+        }
     }
 
     // ---------- État du moteur ----------
@@ -212,7 +226,7 @@ object Core {
                     }
                 }
                 val grant = if (outTxt.contains("GRANT=0") || canToggleDebug()) "activation automatique du débogage autorisée ✓"
-                else "activation automatique refusée par le téléphone (il faudra activer le débogage sans fil à la main après un redémarrage)"
+                else "après un redémarrage, il suffira d'activer le débogage sans fil (tuile des réglages rapides) : Déclic lancera le moteur et le recoupera tout seul"
                 startMsg = if (alive) "✓ Moteur lancé, débogage sans fil coupé · $grant"
                 else "✗ Le moteur ne répond pas. Réponse du système : ${outTxt.toString().trim().take(200)}"
                 main.post { update() }
