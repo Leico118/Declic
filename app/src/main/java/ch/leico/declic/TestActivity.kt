@@ -22,14 +22,25 @@ class TestActivity : Activity() {
         setContentView(Pad(this))
     }
 
+    private val h = android.os.Handler(android.os.Looper.getMainLooper())
+    private val poll = object : Runnable {
+        override fun run() {
+            if (Core.running) Core.send("Q")
+            window.decorView.findViewById<View>(android.R.id.content)?.let { (it as? android.view.ViewGroup)?.getChildAt(0)?.invalidate() }
+            h.postDelayed(this, 1000)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         Core.testOpen = true
         Core.refreshTarget()
+        h.post(poll)
     }
 
     override fun onPause() {
         super.onPause()
+        h.removeCallbacks(poll)
         Core.testOpen = false
         Core.refreshTarget()
     }
@@ -65,11 +76,9 @@ class TestActivity : Activity() {
             if (e.actionMasked != MotionEvent.ACTION_MOVE) {
                 val idx = e.actionIndex
                 val id = e.getPointerId(idx)
-                var line = "${actionName(e)} doigt $id · ${e.pointerCount} doigt(s) · appareil ${e.deviceId}"
-                val k = Core.lastKeyAt
-                if (id == 20 && e.actionMasked != MotionEvent.ACTION_UP && e.actionMasked != MotionEvent.ACTION_POINTER_UP && k > 0) {
-                    line += " · touche→appui ${SystemClock.uptimeMillis() - k} ms"
-                }
+                var line = "${actionName(e)} doigt $id · ${e.pointerCount} doigt(s)"
+                // Délai entre l'envoi de l'événement (par Déclic ou l'écran) et sa réception ici
+                line += " · attente système ${SystemClock.uptimeMillis() - e.eventTime} ms"
                 log.addFirst(line)
                 while (log.size > 12) log.removeLast()
             }
@@ -99,6 +108,10 @@ class TestActivity : Activity() {
             var y = 28 * dp
             canvas.drawText("Zone de test Déclic : pose des doigts + appuie sur ta touche", 12 * dp, y, white)
             y += 20 * dp
+            for (l in Core.engineInfo.split("\n")) {
+                canvas.drawText(l.take(140), 12 * dp, y, grey)
+                y += 16 * dp
+            }
             canvas.drawText("Mode ${if (Prefs.injectMode == 0) "A · fusion" else "B · simple"} · événements $total · annulations $cancels", 12 * dp, y, grey)
             y += 22 * dp
             for (l in log) {
