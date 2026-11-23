@@ -11,8 +11,8 @@ android {
         applicationId = "ch.leico.declic"
         minSdk = 28
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.2.0"
+        versionCode = 5
+        versionName = "0.2.1"
     }
 
     signingConfigs {
@@ -68,6 +68,6 @@ dependencies {
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
     implementation("org.conscrypt:conscrypt-android:2.5.3")
     // Création du certificat d'association
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcpkix-jdk15to18:1.81")
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
 }
