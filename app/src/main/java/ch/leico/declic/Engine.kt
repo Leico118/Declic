@@ -31,7 +31,7 @@ import java.util.concurrent.TimeUnit
  */
 object Engine {
 
-    private const val VIRTUAL_ID = 20
+    private const val VIRTUAL_KEY = 100 // clé interne du doigt de la touche (son numéro Android est attribué librement)
     private const val MAX_SLOTS = 16
     private const val EVIOCGRAB = 0x40044590
 
@@ -60,7 +60,7 @@ object Engine {
     private var injector: Injector? = null
 
     // État du flux tactile envoyé au système
-    private class Ptr(val id: Int, var x: Float, var y: Float)
+    private class Ptr(val key: Int, val id: Int, var x: Float, var y: Float)
     private val ptrs = ArrayList<Ptr>()
     private var downTime = 0L
 
@@ -149,7 +149,7 @@ object Engine {
                 trigDev = p.getOrElse(3) { "" }
                 updateReaders()
             }
-            'G' -> {
+            'G' -> if (!displayOk) {
                 val p = line.split(" ")
                 curW = p[1].toInt()
                 curH = p[2].toInt()
@@ -183,7 +183,8 @@ object Engine {
         if (enabled) sb.append(if (layerActive) " · prêt (fusion multi-touch)" else " · prêt (simple)")
         sb.append(" · ").append(keyGrabInfo)
         sb.append(" · dernier appui réel ${if (lastDur < 0) "—" else "$lastDur ms"} (min. $minHoldMs ms)")
-        sb.append("\n[Fusion] ").append(layerInfo)
+        sb.append("\n[Fusion] ").append(layerInfo).append(" · écran ${curW}x$curH rot $rot")
+        if (displayErr.isNotEmpty()) sb.append(" · ").append(displayErr)
             .append(" · trames écran ×$frames · envoyés ×$sent · refusés ×$refused")
         if (lastErr.isNotEmpty()) sb.append("\nDernière erreur : ").append(lastErr)
         return sb.toString()
@@ -403,9 +404,48 @@ object Engine {
             virtualDown = false
             layerActive = true
         }
+        refreshDisplay()
         val r = Reader(ts.first, true) { t, c, v -> onTouch(t, c, v) }
         touchReader = r
         r.start()
+        startDisplayPoll()
+    }
+
+    /** Lit la taille et la rotation réelles de l'écran (ne dépend plus de l'appli). */
+    private fun refreshDisplay() {
+        try {
+            val dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
+            val inst = dmg.getMethod("getInstance").invoke(null)
+            val info = dmg.getMethod("getDisplayInfo", Int::class.javaPrimitiveType).invoke(inst, 0) ?: return
+            val c = info.javaClass
+            val w = c.getField("logicalWidth").getInt(info)
+            val hh = c.getField("logicalHeight").getInt(info)
+            val r = c.getField("rotation").getInt(info)
+            if (w > 0 && hh > 0) {
+                displayOk = true
+                curW = w
+                curH = hh
+                rot = r
+            }
+        } catch (e: Throwable) {
+            displayErr = "lecture rotation : ${e.cause ?: e}"
+        }
+    }
+
+    @Volatile private var displayErr = ""
+    @Volatile private var displayOk = false
+
+    private fun startDisplayPoll() {
+        Thread({
+            while (layerActive) {
+                refreshDisplay()
+                try {
+                    Thread.sleep(300)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }, "declic-ecran").apply { isDaemon = true }.start()
     }
 
     private fun stopLayer() {
@@ -522,9 +562,16 @@ object Engine {
         }
     }
 
-    private fun ptrIndex(id: Int): Int {
-        for (i in ptrs.indices) if (ptrs[i].id == id) return i
+    private fun ptrIndex(key: Int): Int {
+        for (i in ptrs.indices) if (ptrs[i].key == key) return i
         return -1
+    }
+
+    /** Plus petit numéro de doigt libre, comme le fait Android (0, 1, 2…). */
+    private fun freeId(): Int {
+        var id = 0
+        while (ptrs.any { it.id == id }) id++
+        return id
     }
 
     private fun commitFrame() {
@@ -562,8 +609,8 @@ object Engine {
         if (moved && !emitted && ptrs.isNotEmpty()) send(MotionEvent.ACTION_MOVE)
     }
 
-    private fun addPointer(id: Int, x: Float, y: Float) {
-        ptrs.add(Ptr(id, x, y))
+    private fun addPointer(key: Int, x: Float, y: Float) {
+        ptrs.add(Ptr(key, freeId(), x, y))
         if (ptrs.size == 1) {
             downTime = SystemClock.uptimeMillis()
             send(MotionEvent.ACTION_DOWN)
@@ -572,8 +619,8 @@ object Engine {
         }
     }
 
-    private fun removePointer(id: Int) {
-        val i = ptrIndex(id)
+    private fun removePointer(key: Int) {
+        val i = ptrIndex(key)
         if (i < 0) return
         if (ptrs.size == 1) send(MotionEvent.ACTION_UP)
         else send(MotionEvent.ACTION_POINTER_UP or (i shl MotionEvent.ACTION_POINTER_INDEX_SHIFT))
@@ -581,7 +628,7 @@ object Engine {
     }
 
     private fun releaseAll() {
-        while (ptrs.isNotEmpty()) removePointer(ptrs.last().id)
+        while (ptrs.isNotEmpty()) removePointer(ptrs.last().key)
         virtualDown = false
     }
 
@@ -683,7 +730,7 @@ object Engine {
     private fun virtualDownNow() {
         if (layerActive) {
             virtualDown = true
-            addPointer(VIRTUAL_ID, tx, ty)
+            addPointer(VIRTUAL_KEY, tx, ty)
         } else {
             simplePressed = true
             simpleDown = SystemClock.uptimeMillis()
@@ -696,7 +743,7 @@ object Engine {
         if (layerActive) {
             if (virtualDown) {
                 virtualDown = false
-                removePointer(VIRTUAL_ID)
+                removePointer(VIRTUAL_KEY)
             }
         } else if (simplePressed) {
             simpleRelease()

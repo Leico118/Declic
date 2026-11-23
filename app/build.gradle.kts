@@ -11,8 +11,8 @@ android {
         applicationId = "ch.leico.declic"
         minSdk = 28
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.4.2"
+        versionCode = 14
+        versionName = "0.4.3"
     }
 
     signingConfigs {
