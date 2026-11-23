@@ -11,8 +11,8 @@ android {
         applicationId = "ch.leico.declic"
         minSdk = 28
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.2.0"
     }
 
     signingConfigs {
@@ -44,8 +44,18 @@ android {
     }
 
     buildFeatures {
-        aidl = true
         buildConfig = true
+    }
+
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+            )
+        }
     }
 }
 
@@ -54,7 +64,10 @@ kotlin {
 }
 
 dependencies {
-    implementation("dev.rikka.shizuku:api:13.1.5")
-    implementation("dev.rikka.shizuku:provider:13.1.5")
+    // Connexion au débogage sans fil du téléphone (remplace Shizuku)
+    implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
+    // Création du certificat d'association
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
 }

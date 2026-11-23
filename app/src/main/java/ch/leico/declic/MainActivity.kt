@@ -34,8 +34,6 @@ class MainActivity : Activity() {
     private val dp by lazy { resources.displayMetrics.density }
 
     private lateinit var root: LinearLayout
-    private lateinit var tvShizuku: TextView
-    private lateinit var btnShizuku: Button
     private lateinit var tvA11y: TextView
     private lateinit var btnA11y: Button
     private lateinit var tvEngine: TextView
@@ -44,6 +42,7 @@ class MainActivity : Activity() {
 
     private val ticker = object : Runnable {
         override fun run() {
+            if (Core.running) Core.send("Q")
             refreshStatus()
             h.postDelayed(this, 1000)
         }
@@ -67,7 +66,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        Core.tryBind()
+        Core.start()
         refreshTrigger()
         refreshProfiles()
         h.post(ticker)
@@ -89,9 +88,18 @@ class MainActivity : Activity() {
         })
         root.addView(text("Une touche → un appui sur l'écran, seulement dans les applis choisies.", grey, 14f))
 
-        card("1 · Shizuku (le moteur rapide)").apply {
-            tvShizuku = text("", Color.WHITE, 14f).also { addView(it) }
-            btnShizuku = button("") { onShizukuButton() }.also { addView(it) }
+        card("1 · Démarrage (débogage sans fil)").apply {
+            tvEngine = text("", Color.WHITE, 13f).also { addView(it) }
+            addView(button("Démarrer") { Core.start() })
+            addView(text("Une seule fois : active les Options pour les développeurs et le « Débogage sans fil » (Wi-Fi allumé), puis touche « Associer » et suis la notification.\nAprès chaque redémarrage du téléphone : réactive le débogage sans fil, puis touche Démarrer.", grey, 12f))
+            addView(button("Associer (une seule fois)") { startPairing() })
+            addView(button("Ouvrir les options pour les développeurs") {
+                try {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                } catch (_: Exception) {
+                    startActivity(Intent(Settings.ACTION_SETTINGS))
+                }
+            })
         }
 
         card("2 · Service d'accessibilité").apply {
@@ -105,18 +113,13 @@ class MainActivity : Activity() {
             })
         }
 
-        card("3 · Moteur").apply {
-            tvEngine = text("", Color.WHITE, 13f).also { addView(it) }
-            addView(button("Redémarrer le moteur") { Core.restartEngine() })
-        }
-
-        card("4 · Ta touche").apply {
+        card("3 · Ta touche").apply {
             tvTrigger = text("", Color.WHITE, 14f).also { addView(it) }
             addView(button("Détecter la touche") { detect() })
             addView(text("Pense à régler l'action du Quick Button sur « Aucune » dans les paramètres du téléphone, sinon il ouvrira aussi l'appareil photo.", grey, 12f))
         }
 
-        card("5 · Applis").apply {
+        card("4 · Applis").apply {
             addView(Switch(this@MainActivity).apply {
                 text = "Remappage actif"
                 textSize = 16f
@@ -204,51 +207,35 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun onShizukuButton() {
-        when (Core.shizukuState()) {
-            1 -> Core.requestPermission()
-            0 -> try {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=moe.shizuku.privileged.api")))
-            } catch (_: Exception) {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=moe.shizuku.privileged.api")))
-            }
-            else -> Core.tryBind()
+    private fun startPairing() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+            toast("Autorise les notifications, puis retouche « Associer ».")
+            return
         }
+        Core.startPairDiscovery()
+        PairNotif.show(this, "Ouvre Débogage sans fil → « Associer l'appareil avec un code d'association », puis reviens ici (glisse le volet) pour taper le code.")
+        AlertDialog.Builder(this)
+            .setTitle("Association")
+            .setMessage("1. Dans Options pour les développeurs, touche « Débogage sans fil » (le texte, pas l'interrupteur).\n2. Touche « Associer l'appareil avec un code d'association ».\n3. Sans fermer cette fenêtre, descends le volet des notifications : dans celle de Déclic, touche « Entrer le code » et tape le code à 6 chiffres.")
+            .setPositiveButton("C'est parti") { _, _ ->
+                try {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                } catch (_: Exception) {
+                    startActivity(Intent(Settings.ACTION_SETTINGS))
+                }
+            }
+            .show()
     }
 
     private fun refreshStatus() {
-        when (Core.shizukuState()) {
-            0 -> {
-                tvShizuku.text = "✗ Shizuku n'est pas installé ou pas démarré."
-                btnShizuku.text = "Installer Shizuku"
-                btnShizuku.visibility = View.VISIBLE
-            }
-            1 -> {
-                tvShizuku.text = "• Shizuku tourne, mais Déclic n'est pas encore autorisé."
-                btnShizuku.text = "Autoriser Déclic"
-                btnShizuku.visibility = View.VISIBLE
-            }
-            else -> {
-                tvShizuku.text = "✓ Shizuku prêt et autorisé."
-                btnShizuku.visibility = View.GONE
-            }
-        }
         val a = a11yOn() && ForegroundWatcher.instance != null
         tvA11y.text = if (a) "✓ Activé" else "✗ Pas activé : Réglages → Accessibilité → Applis installées → Déclic"
         btnA11y.visibility = if (a) View.GONE else View.VISIBLE
 
-        val s = Core.service
-        tvEngine.text = if (s == null) {
-            Core.tryBind()
-            "✗ Pas connecté" + (Core.lastError?.let { "\n$it" } ?: "")
-        } else {
-            try {
-                "✓ " + s.ping()
-            } catch (e: Exception) {
-                Core.service = null
-                "✗ Moteur perdu, reconnexion…"
-            }
-        }
+        tvEngine.text = if (Core.running) Core.status + (if (Core.engineInfo.isNotEmpty()) "\n" + Core.engineInfo else "") else Core.status
     }
 
     private fun refreshTrigger() {
@@ -275,7 +262,7 @@ class MainActivity : Activity() {
     }
 
     private fun detect() {
-        val s = Core.service ?: return toast("Le moteur n'est pas connecté : termine d'abord les étapes 1 à 3.")
+        if (!Core.running) return toast("Le moteur n'est pas démarré : termine d'abord l'étape 1.")
         val items = ArrayList<Det>()
         val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1)
         val list = ListView(this).apply { this.adapter = adapter }
@@ -293,11 +280,9 @@ class MainActivity : Activity() {
             adapter.addAll(items.map { "${evName(it.type, it.code)} · ×${it.count} · valeur ${it.value}\n${it.dev}" })
         }
 
-        val cb = object : IEventCallback.Stub() {
-            override fun onEvent(deviceName: String?, type: Int, code: Int, value: Int) {
-                runOnUiThread {
-                    if (!open) return@runOnUiThread
-                    val dev = deviceName ?: "?"
+        val listener: (String, Int, Int, Int) -> Unit = { dev, type, code, value ->
+            runOnUiThread {
+                if (open) {
                     var d = items.firstOrNull { it.dev == dev && it.type == type && it.code == code }
                     if (d == null) {
                         d = Det(dev, type, code)
@@ -318,19 +303,16 @@ class MainActivity : Activity() {
         }
         dlg.setOnDismissListener {
             open = false
-            try {
-                s.stopDetection()
-            } catch (_: Exception) {
-            }
+            Core.detectListener = null
+            Core.setDetection(false)
             Core.pushAll()
             refreshTrigger()
         }
         dlg.show()
         h.postDelayed({
-            if (open) try {
-                s.startDetection(cb)
-            } catch (e: Exception) {
-                toast("Erreur : $e")
+            if (open) {
+                Core.detectListener = listener
+                Core.setDetection(true)
             }
         }, 400)
     }

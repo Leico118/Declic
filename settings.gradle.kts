@@ -11,6 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // libadb-android (connexion au débogage sans fil)
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

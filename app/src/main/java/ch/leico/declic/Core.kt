@@ -1,60 +1,42 @@
 package ch.leico.declic
 
-import android.content.ComponentName
 import android.content.Context
-import android.content.ServiceConnection
-import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Handler
-import android.os.IBinder
 import android.os.Looper
 import android.view.Display
-import rikka.shizuku.Shizuku
+import io.github.muntashirakon.adb.AdbStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.NetworkInterface
+import java.util.concurrent.Executors
 
-/** Lien entre l'appli et le « moteur » (processus lancé par Shizuku, qui lit la touche et simule l'appui). */
+/** Démarre le moteur via le débogage sans fil et lui transmet les réglages. */
 object Core {
     lateinit var app: Context
-    @Volatile var service: IDeclicService? = null
     @Volatile var currentPkg: String? = null
-    @Volatile var lastError: String? = null
     @Volatile var pickerOpen = false
+    @Volatile var running = false
+    @Volatile var starting = false
+    @Volatile var status: String = "Arrêté"
+    @Volatile var engineInfo: String = ""
+    @Volatile var detectListener: ((String, Int, Int, Int) -> Unit)? = null
+    @Volatile var pairPort = 0
+
+    private var stream: AdbStream? = null
+    @Volatile private var out: OutputStream? = null
+    private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private var inited = false
-    private var binding = false
-
-    private val args by lazy {
-        Shizuku.UserServiceArgs(ComponentName(app.packageName, DeclicUserService::class.java.name))
-            .daemon(false)
-            .processNameSuffix("moteur")
-            .debuggable(BuildConfig.DEBUG)
-            .version(BuildConfig.VERSION_CODE)
-    }
-
-    private val conn = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            binding = false
-            if (binder != null && binder.pingBinder()) {
-                service = IDeclicService.Stub.asInterface(binder)
-                pushAll()
-            }
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            service = null
-            binding = false
-        }
-    }
+    private var nsdListener: NsdManager.DiscoveryListener? = null
 
     fun init(ctx: Context) {
         if (inited) return
         inited = true
         app = ctx.applicationContext
         Prefs.init(app)
-        Shizuku.addBinderReceivedListenerSticky(Shizuku.OnBinderReceivedListener { main.post { tryBind() } })
-        Shizuku.addBinderDeadListener(Shizuku.OnBinderDeadListener { service = null; binding = false })
-        Shizuku.addRequestPermissionResultListener(Shizuku.OnRequestPermissionResultListener { _, res ->
-            if (res == PackageManager.PERMISSION_GRANTED) main.post { tryBind() }
-        })
         app.getSystemService(DisplayManager::class.java).registerDisplayListener(object : DisplayManager.DisplayListener {
             override fun onDisplayAdded(displayId: Int) {}
             override fun onDisplayRemoved(displayId: Int) {}
@@ -64,58 +46,91 @@ object Core {
         }, main)
     }
 
-    /** 0 = Shizuku absent ou arrêté, 1 = autorisation manquante, 2 = prêt. */
-    fun shizukuState(): Int = try {
-        when {
-            !Shizuku.pingBinder() -> 0
-            Shizuku.isPreV11() -> 0
-            Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED -> 1
-            else -> 2
+    // ---------- Démarrage du moteur ----------
+
+    fun start() {
+        if (running || starting) return
+        starting = true
+        status = "Connexion…"
+        io.execute {
+            try {
+                val m = AdbManager.get(app)
+                val apk = app.applicationInfo.sourceDir
+                val cmd = "shell:CLASSPATH=$apk exec app_process /system/bin ch.leico.declic.Engine"
+                val s = try {
+                    m.openStream(cmd)
+                } catch (_: Throwable) {
+                    val ok = try {
+                        m.connectTls(app, 8000)
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    if (!ok) throw Exception("Connexion impossible. Le débogage sans fil est-il activé (Wi-Fi allumé) ? L'association a-t-elle été faite ?")
+                    m.openStream(cmd)
+                }
+                stream = s
+                out = s.openOutputStream()
+                running = true
+                status = "✓ Moteur démarré"
+                val input = s.openInputStream()
+                Thread({ readLoop(input) }, "declic-lecture").start()
+                pushAll()
+            } catch (e: Throwable) {
+                running = false
+                status = "✗ " + (e.message ?: e.toString())
+            } finally {
+                starting = false
+            }
         }
-    } catch (_: Throwable) {
-        0
     }
 
-    fun requestPermission() {
+    private fun readLoop(input: InputStream) {
         try {
-            Shizuku.requestPermission(42)
-        } catch (e: Throwable) {
-            lastError = e.toString()
-        }
-    }
-
-    fun tryBind() {
-        if (service != null || binding) return
-        if (shizukuState() != 2) return
-        try {
-            binding = true
-            Shizuku.bindUserService(args, conn)
-        } catch (e: Throwable) {
-            binding = false
-            lastError = e.toString()
-        }
-    }
-
-    fun restartEngine() {
-        try {
-            Shizuku.unbindUserService(args, conn, true)
+            input.bufferedReader().forEachLine { onLine(it) }
         } catch (_: Throwable) {
         }
-        service = null
-        binding = false
-        main.postDelayed({ tryBind() }, 700)
+        running = false
+        out = null
+        stream = null
+        if (!status.startsWith("✗")) status = "✗ Moteur arrêté (touche Démarrer)"
+    }
+
+    private fun onLine(line: String) {
+        if (line.isEmpty()) return
+        when {
+            line.startsWith("E ") -> {
+                val p = line.split(" ", limit = 5)
+                if (p.size >= 4) {
+                    detectListener?.invoke(p.getOrElse(4) { "?" }, p[1].toInt(), p[2].toInt(), p[3].toInt())
+                }
+            }
+            line.startsWith("S ") -> engineInfo = line.substring(2)
+            line == "R" -> status = "✓ Moteur démarré"
+            else -> engineInfo = "Message du système : $line"
+        }
+    }
+
+    fun send(line: String) {
+        io.execute {
+            val o = out ?: return@execute
+            try {
+                o.write((line + "\n").toByteArray())
+                o.flush()
+            } catch (_: Throwable) {
+                running = false
+                out = null
+            }
+        }
     }
 
     fun pushAll() {
-        val s = service ?: return
-        try {
-            s.setInjectMode(Prefs.injectMode)
-            s.setTrigger(Prefs.trigDevice ?: "", Prefs.trigType, Prefs.trigCode)
-        } catch (e: Throwable) {
-            lastError = e.toString()
-        }
+        send("M ${Prefs.injectMode}")
+        val dev = Prefs.trigDevice
+        if (!dev.isNullOrEmpty()) send("T ${Prefs.trigType} ${Prefs.trigCode} $dev")
         refreshTarget()
     }
+
+    fun setDetection(on: Boolean) = send(if (on) "D 1" else "D 0")
 
     fun onForeground(pkg: String) {
         if (pkg == currentPkg) return
@@ -125,18 +140,89 @@ object Core {
 
     /** Envoie au moteur la position à toucher pour l'appli au premier plan (ou désactive). */
     fun refreshTarget() {
-        val s = service ?: return
+        if (!running) return
         val pkg = currentPkg
         val p = if (Prefs.active && !pickerOpen && pkg != null) Prefs.profile(pkg) else null
-        try {
-            if (p != null && p.hasPos) {
-                val (x, y) = Geo.fromNatural(Geo.screen(app), p.fx, p.fy)
-                s.setTarget(true, x, y)
-            } else {
-                s.setTarget(false, 0f, 0f)
+        if (p != null && p.hasPos) {
+            val (x, y) = Geo.fromNatural(Geo.screen(app), p.fx, p.fy)
+            send("P 1 $x $y")
+        } else {
+            send("P 0 0 0")
+        }
+    }
+
+    // ---------- Association (une seule fois) ----------
+
+    fun startPairDiscovery() {
+        if (nsdListener != null) return
+        pairPort = 0
+        val nsd = app.getSystemService(NsdManager::class.java)
+        val l = object : NsdManager.DiscoveryListener {
+            override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {}
+            override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
+            override fun onDiscoveryStarted(serviceType: String?) {}
+            override fun onDiscoveryStopped(serviceType: String?) {}
+            override fun onServiceLost(serviceInfo: NsdServiceInfo?) {}
+            override fun onServiceFound(serviceInfo: NsdServiceInfo?) {
+                if (serviceInfo != null) resolve(nsd, serviceInfo)
             }
-        } catch (e: Throwable) {
-            lastError = e.toString()
+        }
+        try {
+            nsd.discoverServices("_adb-tls-pairing._tcp", NsdManager.PROTOCOL_DNS_SD, l)
+            nsdListener = l
+        } catch (_: Throwable) {
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun resolve(nsd: NsdManager, info: NsdServiceInfo) {
+        try {
+            nsd.resolveService(info, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {}
+                override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
+                    val si = serviceInfo ?: return
+                    val host = si.host?.hostAddress
+                    if (host == null || isLocal(host)) {
+                        pairPort = si.port
+                        PairNotif.show(app, "Fenêtre d'association détectée ✓\nTouche « Entrer le code » et tape le code à 6 chiffres.")
+                    }
+                }
+            })
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun isLocal(host: String): Boolean = try {
+        val h = host.substringBefore('%')
+        NetworkInterface.getNetworkInterfaces().toList().any { ni ->
+            ni.inetAddresses.toList().any { it.hostAddress?.substringBefore('%') == h }
+        }
+    } catch (_: Throwable) {
+        true
+    }
+
+    fun stopPairDiscovery() {
+        val l = nsdListener ?: return
+        nsdListener = null
+        try {
+            app.getSystemService(NsdManager::class.java).stopServiceDiscovery(l)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun pair(code: String) {
+        io.execute {
+            try {
+                val port = pairPort
+                if (port == 0) throw Exception("Fenêtre d'association pas détectée. Ouvre « Associer l'appareil avec un code d'association », puis réessaie.")
+                val ok = AdbManager.get(app).pair("127.0.0.1", port, code.trim())
+                if (!ok) throw Exception("Code refusé, réessaie avec un nouveau code.")
+                stopPairDiscovery()
+                PairNotif.show(app, "Association réussie ✓ Tu peux revenir dans Déclic.", withInput = false)
+                main.post { start() }
+            } catch (e: Throwable) {
+                PairNotif.show(app, "Échec : ${e.message ?: e}")
+            }
         }
     }
 }

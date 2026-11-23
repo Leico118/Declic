@@ -18,7 +18,7 @@ class ForegroundWatcher : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         Core.init(this)
-        Core.tryBind()
+        Core.start()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -28,7 +28,6 @@ class ForegroundWatcher : AccessibilityService() {
         val cls = e.className?.toString() ?: return
         if (!isActivity(pkg, cls)) return // ignore volets, claviers, bulles…
         Core.onForeground(pkg)
-        if (Core.service == null) Core.tryBind()
     }
 
     private fun isActivity(pkg: String, cls: String): Boolean =
