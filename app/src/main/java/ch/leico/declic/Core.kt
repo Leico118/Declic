@@ -107,7 +107,7 @@ object Core {
                     detectListener?.invoke(p.getOrElse(4) { "?" }, p[1].toInt(), p[2].toInt(), p[3].toInt())
                 }
             }
-            line.startsWith("S ") -> engineInfo = line.substring(2)
+            line.startsWith("S ") -> engineInfo = line.substring(2).replace(" ⏎ ", "\n")
             line == "R" -> status = "✓ Moteur démarré"
             else -> engineInfo = "Message du système : $line"
         }

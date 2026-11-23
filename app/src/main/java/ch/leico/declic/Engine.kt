@@ -78,6 +78,10 @@ object Engine {
     private val slotX = IntArray(MAX_SLOTS)
     private val slotY = IntArray(MAX_SLOTS)
     private var virtualDown = false
+    @Volatile private var layerInfo = "pas encore lancée"
+    @Volatile private var frames = 0
+    @Volatile private var sent = 0
+    @Volatile private var refused = 0
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -115,7 +119,7 @@ object Engine {
 
     private fun emit(s: String) {
         synchronized(out) {
-            out.print(s.replace('\n', ' '))
+            out.print(s.replace("\n", " ⏎ "))
             out.print('\n')
             out.flush()
         }
@@ -162,7 +166,9 @@ object Engine {
         val n = synchronized(readersLock) { readers.size }
         val sb = StringBuilder("uid ${Process.myUid()} · $n périph. · touche ×$triggerCount · appuis ×$injectCount")
         if (enabled) sb.append(if (layerActive) " · prêt (fusion multi-touch)" else " · prêt (simple)")
-        if (lastErr.isNotEmpty()) sb.append(" · Dernière erreur : ").append(lastErr)
+        sb.append("\n[Fusion] ").append(layerInfo)
+            .append(" · trames écran ×$frames · envoyés ×$sent · refusés ×$refused")
+        if (lastErr.isNotEmpty()) sb.append("\nDernière erreur : ").append(lastErr)
         return sb.toString()
     }
 
@@ -239,10 +245,13 @@ object Engine {
             try {
                 val s = FileInputStream(path)
                 stream = s
-                if (grab && !grabDevice(s.fd)) {
-                    grabFailed = true
-                    onGrabFailed()
-                    return
+                if (grab) {
+                    if (!grabDevice(s.fd)) {
+                        grabFailed = true
+                        onGrabFailed()
+                        return
+                    }
+                    layerInfo = layerInfo.replace("prise en main…", "prise en main OK")
                 }
                 var pending = 0
                 while (!stopped) {
@@ -313,7 +322,7 @@ object Engine {
                 err = (e.cause ?: e).toString()
             }
         }
-        lastErr = "prise en main de l'écran impossible ($err) → mode simple"
+        layerInfo = layerInfo.replace("prise en main…", "prise en main ÉCHEC ($err) → mode simple")
         return false
     }
 
@@ -341,13 +350,10 @@ object Engine {
         if (injectMode != 0 || touchReader != null) return
         val ts = findTouchscreen()
         if (ts == null) {
-            lastErr = "écran tactile introuvable → mode simple"
+            layerInfo = "écran tactile introuvable → mode simple"
             return
         }
-        if (!readRanges(ts.first)) {
-            lastErr = "plage de l'écran tactile illisible → mode simple"
-            return
-        }
+        layerInfo = "écran « ${ts.second} » (${ts.first.substringAfterLast('/')}) X $minX..$maxX Y $minY..$maxY id $touchDevId · ${curW}x$curH rot $rot · prise en main…"
         synchronized(stateLock) {
             for (i in 0 until MAX_SLOTS) slotTrack[i] = -1
             curSlot = 0
@@ -386,23 +392,37 @@ object Engine {
         touchReader = null
     }
 
+    /** Choisit le vrai écran tactile : celui qui a la plus grande surface multi-touch. Remplit minX… */
+    private var tsCache: Pair<String, String>? = null
+
     private fun findTouchscreen(): Pair<String, String>? {
-        var name: String? = null
+        tsCache?.let { return it }
+        val tsNames = HashMap<String, Int>()
         try {
             for (id in InputDevice.getDeviceIds()) {
                 val d = InputDevice.getDevice(id) ?: continue
-                if (d.supportsSource(InputDevice.SOURCE_TOUCHSCREEN) && !d.isVirtual) {
-                    name = d.name
-                    touchDevId = id
-                    break
-                }
+                if (d.supportsSource(InputDevice.SOURCE_TOUCHSCREEN) && !d.isVirtual) tsNames[d.name] = id
             }
         } catch (_: Throwable) {
         }
-        val devs = listDevices()
-        devs.firstOrNull { it.second == name }?.let { return it }
-        // secours : premier périphérique qui annonce des positions multi-touch
-        return devs.firstOrNull { getevent(it.first).contains(Regex("\\b0035\\b")) }
+        var best: Pair<String, String>? = null
+        var bestArea = -1L
+        var bx = intArrayOf(0, 1, 0, 1)
+        for (dev in listDevices()) {
+            val r = ranges(dev.first) ?: continue
+            var area = (r[1] - r[0]).toLong() * (r[3] - r[2]).toLong()
+            if (tsNames.containsKey(dev.second)) area *= 4 // priorité aux écrans connus d'Android
+            if (area > bestArea) {
+                bestArea = area
+                best = dev
+                bx = r
+            }
+        }
+        val b = best ?: return null
+        minX = bx[0]; maxX = bx[1]; minY = bx[2]; maxY = bx[3]
+        touchDevId = tsNames[b.second] ?: tsNames.values.firstOrNull() ?: 0
+        tsCache = b
+        return b
     }
 
     private fun getevent(path: String): String = try {
@@ -414,17 +434,16 @@ object Engine {
         ""
     }
 
-    private fun readRanges(path: String): Boolean {
+    private fun ranges(path: String): IntArray? {
         val txt = getevent(path)
         fun range(code: String): Pair<Int, Int>? {
             val m = Regex("\\b$code\\s*:\\s*value\\s*-?\\d+,\\s*min\\s*(-?\\d+),\\s*max\\s*(-?\\d+)").find(txt) ?: return null
             return m.groupValues[1].toInt() to m.groupValues[2].toInt()
         }
-        val rx = range("0035") ?: return false
-        val ry = range("0036") ?: return false
-        minX = rx.first; maxX = rx.second
-        minY = ry.first; maxY = ry.second
-        return maxX > minX && maxY > minY
+        val rx = range("0035") ?: return null
+        val ry = range("0036") ?: return null
+        if (rx.second <= rx.first || ry.second <= ry.first) return null
+        return intArrayOf(rx.first, rx.second, ry.first, ry.second)
     }
 
     /** Position brute de l'écran tactile -> coordonnées de l'écran dans l'orientation actuelle. */
@@ -455,6 +474,7 @@ object Engine {
                     0x36 -> slotY[curSlot] = value
                 }
             } else if (type == 0 && code == 0) {
+                frames++
                 commitFrame()
             }
         }
@@ -547,8 +567,13 @@ object Engine {
             )
             val ok = inj.inject(ev)
             ev.recycle()
-            if (!ok) lastErr = "appui refusé par le système"
+            sent++
+            if (!ok) {
+                refused++
+                lastErr = "appui refusé par le système (action $action)"
+            }
         } catch (e: Throwable) {
+            refused++
             lastErr = "appui : ${e.cause ?: e}"
         }
     }
