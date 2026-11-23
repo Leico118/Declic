@@ -24,6 +24,8 @@ object Core {
     @Volatile var engineInfo: String = ""
     @Volatile var detectListener: ((String, Int, Int, Int) -> Unit)? = null
     @Volatile var pairPort = 0
+    /** Vrai quand la touche est remappée dans l'appli au premier plan (sert à bloquer son action d'origine). */
+    @Volatile var mappingActive = false
 
     private var stream: AdbStream? = null
     @Volatile private var out: OutputStream? = null
@@ -90,6 +92,7 @@ object Core {
         } catch (_: Throwable) {
         }
         running = false
+        mappingActive = false
         out = null
         stream = null
         if (!status.startsWith("✗")) status = "✗ Moteur arrêté (touche Démarrer)"
@@ -140,14 +143,26 @@ object Core {
 
     /** Envoie au moteur la position à toucher pour l'appli au premier plan (ou désactive). */
     fun refreshTarget() {
-        if (!running) return
+        if (!running) {
+            mappingActive = false
+            return
+        }
         val pkg = currentPkg
-        val p = if (Prefs.active && !pickerOpen && pkg != null) Prefs.profile(pkg) else null
+        val screenOn = try {
+            app.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY).state == Display.STATE_ON
+        } catch (_: Throwable) {
+            true
+        }
+        val p = if (Prefs.active && !pickerOpen && screenOn && pkg != null) Prefs.profile(pkg) else null
         if (p != null && p.hasPos) {
-            val (x, y) = Geo.fromNatural(Geo.screen(app), p.fx, p.fy)
+            val scr = Geo.screen(app)
+            val (x, y) = Geo.fromNatural(scr, p.fx, p.fy)
+            send("G ${scr.w} ${scr.h} ${scr.rot}")
             send("P 1 $x $y")
+            mappingActive = true
         } else {
             send("P 0 0 0")
+            mappingActive = false
         }
     }
 

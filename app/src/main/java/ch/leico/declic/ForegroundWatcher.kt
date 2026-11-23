@@ -2,6 +2,7 @@ package ch.leico.declic
 
 import android.accessibilityservice.AccessibilityService
 import android.content.ComponentName
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 
 /** Service d'accessibilité : repère l'appli au premier plan et affiche le cercle de placement. */
@@ -43,6 +44,12 @@ class ForegroundWatcher : AccessibilityService() {
     fun showPicker(pkg: String) {
         picker?.close()
         picker = Picker(this, pkg) { picker = null }.also { it.show() }
+    }
+
+    /** Bloque l'action d'origine de la touche (ex. volume) dans les applis où elle est remappée. */
+    override fun onKeyEvent(event: KeyEvent?): Boolean {
+        val e = event ?: return false
+        return Core.mappingActive && Prefs.trigType == 1 && e.scanCode == Prefs.trigCode
     }
 
     override fun onInterrupt() {}

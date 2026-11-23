@@ -136,9 +136,9 @@ class MainActivity : Activity() {
         }
 
         card("Réglage avancé · type d'appui").apply {
-            addView(text("Si dans le jeu l'appui « annule » ton pouce sur l'écran (joystick qui lâche), essaie l'autre mode.", grey, 12f))
+            addView(text("A : dans les applis choisies, Déclic prend la main sur l'écran et y ajoute le doigt de la touche, pour que tu puisses diriger, booster et sauter en même temps. B : ancien mode, plus simple, mais l'appui peut annuler tes autres doigts.", grey, 12f))
             val rg = RadioGroup(this@MainActivity)
-            listOf("A · Doigt virtuel séparé (conseillé)", "B · Même appareil que l'écran").forEachIndexed { i, t ->
+            listOf("A · Fusion multi-touch (conseillé)", "B · Simple").forEachIndexed { i, t ->
                 rg.addView(RadioButton(this@MainActivity).apply {
                     id = 100 + i
                     text = t
