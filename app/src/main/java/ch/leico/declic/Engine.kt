@@ -81,6 +81,9 @@ object Engine {
     private val slotY = IntArray(MAX_SLOTS)
     private var virtualDown = false
     @Volatile private var layerInfo = "pas encore lancée"
+    @Volatile private var grabErr = ""
+    @Volatile private var keyGrabInfo = "touche non réservée"
+    private val powerCache = HashMap<String, Boolean>()
     // Durée minimale d'un appui : certains boutons (Quick Button) envoient « enfoncé » et
     // « relâché » au même instant, trop vite pour que le jeu le voie.
     @Volatile private var minHoldMs = 70L
@@ -177,6 +180,7 @@ object Engine {
         val n = synchronized(readersLock) { readers.size }
         val sb = StringBuilder("uid ${Process.myUid()} · $n périph. · touche ×$triggerCount · appuis ×$injectCount")
         if (enabled) sb.append(if (layerActive) " · prêt (fusion multi-touch)" else " · prêt (simple)")
+        sb.append(" · ").append(keyGrabInfo)
         sb.append(" · dernier appui réel ${if (lastDur < 0) "—" else "$lastDur ms"} (min. $minHoldMs ms)")
         sb.append("\n[Fusion] ").append(layerInfo)
             .append(" · trames écran ×$frames · envoyés ×$sent · refusés ×$refused")
@@ -192,10 +196,12 @@ object Engine {
         if (en && !enabled) {
             enabled = true
             startLayer()
+            updateReaders()
         } else if (!en && enabled) {
             enabled = false
             stopLayer()
             synchronized(stateLock) { if (simplePressed) simpleRelease() }
+            updateReaders()
         }
     }
 
@@ -217,20 +223,32 @@ object Engine {
         }
     }
 
+    /** Le périphérique contient-il le bouton marche/arrêt ? Dans ce cas on ne le réserve jamais. */
+    private fun hasPowerKey(path: String): Boolean = powerCache.getOrPut(path) {
+        val txt = getevent(path)
+        val keys = Regex("KEY \\(0001\\):([\\s\\S]*?)(?:\\n\\s*[A-Z]{2,} \\(|$)").find(txt)?.groupValues?.get(1) ?: txt
+        keys.contains(Regex("\\b0074\\b"))
+    }
+
     private fun updateReaders() {
         synchronized(readersLock) {
             val wanted = listDevices().filter { (_, name) -> detecting || (trigDev.isNotEmpty() && name == trigDev) }.toMap()
+            val grabKey = enabled && !detecting && trigType == 1
             val it = readers.entries.iterator()
             while (it.hasNext()) {
                 val e = it.next()
-                if (!wanted.containsKey(e.key) || !e.value.isAlive) {
+                val wantGrab = grabKey && wanted[e.key] == trigDev && !hasPowerKey(e.key)
+                if (!wanted.containsKey(e.key) || !e.value.isAlive || e.value.grab != wantGrab) {
                     e.value.shutdown()
                     it.remove()
                 }
             }
+            if (!grabKey) keyGrabInfo = "touche non réservée"
             for ((path, name) in wanted) {
                 if (!readers.containsKey(path)) {
-                    val r = Reader(path, false) { t, c, v -> onRawEvent(name, t, c, v) }
+                    val wantGrab = grabKey && name == trigDev && !hasPowerKey(path)
+                    if (grabKey && name == trigDev && !wantGrab) keyGrabInfo = "touche non réservée (même composant que le bouton marche/arrêt)"
+                    val r = Reader(path, wantGrab, false) { t, c, v -> onRawEvent(name, t, c, v) }
                     readers[path] = r
                     r.start()
                 }
@@ -241,6 +259,7 @@ object Engine {
     private class Reader(
         val path: String,
         val grab: Boolean,
+        val required: Boolean = true,
         val handler: (Int, Int, Int) -> Unit,
     ) : Thread("declic-${path.substringAfterLast('/')}") {
         @Volatile var stopped = false
@@ -258,12 +277,18 @@ object Engine {
                 val s = FileInputStream(path)
                 stream = s
                 if (grab) {
-                    if (!grabDevice(s.fd)) {
-                        grabFailed = true
-                        onGrabFailed()
-                        return
+                    val ok = grabDevice(s.fd)
+                    if (required) {
+                        if (!ok) {
+                            grabFailed = true
+                            layerInfo = layerInfo.replace("prise en main…", "prise en main ÉCHEC ($grabErr) → mode simple")
+                            onGrabFailed()
+                            return
+                        }
+                        layerInfo = layerInfo.replace("prise en main…", "prise en main OK")
+                    } else {
+                        keyGrabInfo = if (ok) "touche réservée à Déclic ✓" else "réservation de la touche impossible ($grabErr)"
                     }
-                    layerInfo = layerInfo.replace("prise en main…", "prise en main OK")
                 }
                 var pending = 0
                 while (!stopped) {
@@ -288,7 +313,7 @@ object Engine {
                     stream?.close() // fermer = rendre l'écran au système
                 } catch (_: Throwable) {
                 }
-                if (grab && !stopped) onLayerDied()
+                if (grab && required && !stopped) onLayerDied()
             }
         }
 
@@ -334,7 +359,7 @@ object Engine {
                 err = (e.cause ?: e).toString()
             }
         }
-        layerInfo = layerInfo.replace("prise en main…", "prise en main ÉCHEC ($err) → mode simple")
+        grabErr = err
         return false
     }
 

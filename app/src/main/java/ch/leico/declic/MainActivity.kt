@@ -245,7 +245,7 @@ class MainActivity : Activity() {
 
     // ---------- Détection de la touche ----------
 
-    private class Det(val dev: String, val type: Int, val code: Int) {
+    private class Det(val dev: String, val type: Int, val code: Int, val firstAt: Long) {
         var count = 0
         var value = 0
     }
@@ -269,23 +269,27 @@ class MainActivity : Activity() {
         var open = true
         val dlg = AlertDialog.Builder(this)
             .setTitle("Appuie sur ta touche…")
-            .setMessage("Appuie plusieurs fois sur la touche (sans toucher l'écran), puis touche la ligne qui a le plus de ×. Les lignes « Touche » sont les meilleures.")
+            .setMessage("Sans toucher l'écran : appuie UNE fois sur la touche, puis attends 3 secondes. Le chrono indique quand chaque signal est arrivé après le premier : choisis le signal le plus rapide (+0 ms) qui réagit à ta touche. « Effacer » pour recommencer.")
             .setView(list)
             .setNegativeButton("Fermer", null)
+            .setNeutralButton("Effacer", null)
             .create()
+        var t0 = 0L
 
         fun redraw() {
-            items.sortWith(compareBy<Det>({ if (it.type == 1) 0 else 1 }, { -it.count }))
+            items.sortWith(compareBy<Det> { it.firstAt })
             adapter.clear()
-            adapter.addAll(items.map { "${evName(it.type, it.code)} · ×${it.count} · valeur ${it.value}\n${it.dev}" })
+            adapter.addAll(items.map { "+${it.firstAt} ms · ${evName(it.type, it.code)} · ×${it.count} · valeur ${it.value}\n${it.dev}" })
         }
 
         val listener: (String, Int, Int, Int) -> Unit = { dev, type, code, value ->
             runOnUiThread {
                 if (open) {
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (items.isEmpty()) t0 = now
                     var d = items.firstOrNull { it.dev == dev && it.type == type && it.code == code }
                     if (d == null) {
-                        d = Det(dev, type, code)
+                        d = Det(dev, type, code, now - t0)
                         items.add(d)
                     }
                     if (type != 1 || value == 1) d.count++
@@ -309,6 +313,10 @@ class MainActivity : Activity() {
             refreshTrigger()
         }
         dlg.show()
+        dlg.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            items.clear()
+            adapter.clear()
+        }
         h.postDelayed({
             if (open) {
                 Core.detectListener = listener
