@@ -7,6 +7,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.InputEvent
+import android.view.KeyEvent
 import android.view.MotionEvent
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.io.File
@@ -237,7 +238,7 @@ object Engine {
             val it = readers.entries.iterator()
             while (it.hasNext()) {
                 val e = it.next()
-                val wantGrab = grabKey && wanted[e.key] == trigDev && !hasPowerKey(e.key)
+                val wantGrab = grabKey && wanted[e.key] == trigDev
                 if (!wanted.containsKey(e.key) || !e.value.isAlive || e.value.grab != wantGrab) {
                     e.value.shutdown()
                     it.remove()
@@ -246,9 +247,8 @@ object Engine {
             if (!grabKey) keyGrabInfo = "touche non réservée"
             for ((path, name) in wanted) {
                 if (!readers.containsKey(path)) {
-                    val wantGrab = grabKey && name == trigDev && !hasPowerKey(path)
-                    if (grabKey && name == trigDev && !wantGrab) keyGrabInfo = "touche non réservée (même composant que le bouton marche/arrêt)"
-                    val r = Reader(path, wantGrab, false) { t, c, v -> onRawEvent(name, t, c, v) }
+                    val wantGrab = grabKey && name == trigDev
+                    val r = Reader(path, wantGrab, false) { t, c, v -> onRawEvent(name, t, c, v, wantGrab) }
                     readers[path] = r
                     r.start()
                 }
@@ -363,8 +363,10 @@ object Engine {
         return false
     }
 
-    private fun onRawEvent(dev: String, type: Int, code: Int, value: Int) {
+    private fun onRawEvent(dev: String, type: Int, code: Int, value: Int, grabbed: Boolean = false) {
         if (type == 0) return // EV_SYN
+        // Composant réservé : on renvoie au système les autres boutons (marche/arrêt, volume…)
+        if (grabbed && type == 1 && !(code == trigCode && trigType == 1)) forwardKey(code, value)
         if (type == trigType && code == trigCode && dev == trigDev) {
             if (value != 0) {
                 triggerCount++
@@ -646,6 +648,33 @@ object Engine {
                     virtualUp()
                 }
             }
+        }
+    }
+
+    private val keyDownAt = HashMap<Int, Long>()
+
+    /** Renvoie au système un bouton physique du composant réservé (code noyau -> touche Android). */
+    private fun forwardKey(code: Int, value: Int) {
+        val kc = when (code) {
+            116 -> KeyEvent.KEYCODE_POWER
+            115 -> KeyEvent.KEYCODE_VOLUME_UP
+            114 -> KeyEvent.KEYCODE_VOLUME_DOWN
+            113 -> KeyEvent.KEYCODE_VOLUME_MUTE
+            212 -> KeyEvent.KEYCODE_CAMERA
+            528 -> KeyEvent.KEYCODE_FOCUS
+            else -> return
+        }
+        val inj = injector ?: return
+        try {
+            val now = SystemClock.uptimeMillis()
+            val action = if (value == 0) KeyEvent.ACTION_UP else KeyEvent.ACTION_DOWN
+            if (value == 1) keyDownAt[code] = now
+            val down = keyDownAt[code] ?: now
+            val repeat = if (value == 2) 1 else 0
+            val ev = KeyEvent(down, now, action, kc, repeat, 0, -1, code, 0, InputDevice.SOURCE_KEYBOARD)
+            inj.inject(ev)
+        } catch (e: Throwable) {
+            lastErr = "renvoi bouton $code : ${e.cause ?: e}"
         }
     }
 
