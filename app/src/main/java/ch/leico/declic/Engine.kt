@@ -68,6 +68,8 @@ object Engine {
     @Volatile private var displayErr = ""
     @Volatile private var keyGrabInfo = "—"
     @Volatile private var lastCfg = ""
+    @Volatile private var cgroupInfo = ""
+    private val startedAt = System.currentTimeMillis()
 
     private val readers = HashMap<String, Reader>()
     private val lastSent = ConcurrentHashMap<String, Long>()
@@ -111,6 +113,7 @@ object Engine {
             if (Build.VERSION.SDK_INT >= 28) HiddenApiBypass.addHiddenApiExemptions("")
         } catch (_: Throwable) {
         }
+        escapeCgroup()
         injector = try {
             Injector()
         } catch (e: Throwable) {
@@ -144,6 +147,32 @@ object Engine {
             } catch (_: InterruptedException) {
             }
         }
+    }
+
+    /**
+     * Sort le moteur du groupe de processus du service de débogage (adbd) : sinon, quand le Wi-Fi
+     * se coupe et qu'Android redémarre adbd, le moteur est arrêté avec lui (même méthode que Shizuku).
+     */
+    private fun escapeCgroup() {
+        val pid = Process.myPid().toString()
+        val ok = ArrayList<String>()
+        val ko = ArrayList<String>()
+        for (dir in listOf("/acct", "/dev/cg2_bpf", "/sys/fs/cgroup", "/sys/fs/cgroup/uid_0", "/sys/fs/cgroup/uid_2000")) {
+            val f = File(dir, "cgroup.procs")
+            if (!f.exists()) continue
+            try {
+                f.writeText(pid)
+                ok.add(dir)
+            } catch (e: Throwable) {
+                ko.add(dir)
+            }
+        }
+        val cur = try {
+            File("/proc/self/cgroup").readText().trim().replace("\n", " | ")
+        } catch (_: Throwable) {
+            "?"
+        }
+        cgroupInfo = "groupe : ${if (ok.isEmpty()) "sortie impossible" else "sorti via " + ok.joinToString()} · actuel $cur"
     }
 
     private fun quit() {
@@ -212,6 +241,8 @@ object Engine {
             val sb = StringBuilder("v=${BuildConfig.VERSION_CODE} t=${System.currentTimeMillis()}\n")
             sb.append("✓ Moteur actif (uid ${Process.myUid()}) · $n périph. · touches ×$triggerCount · appuis ×$injectCount")
             sb.append(if (enabled) (if (layerActive) " · prêt (fusion)" else " · prêt (simple)") else " · en veille")
+            val min = (System.currentTimeMillis() - startedAt) / 60000
+            sb.append("\nlancé depuis ${min} min · ").append(cgroupInfo)
             sb.append("\n").append(keyGrabInfo).append(" · dernier appui réel ${if (lastDur < 0) "—" else "$lastDur ms"}")
             sb.append("\n[Fusion] ").append(layerInfo).append(" · écran ${curW}x$curH rot $rot · trames ×$frames · envoyés ×$sent")
             if (displayErr.isNotEmpty()) sb.append("\n").append(displayErr)

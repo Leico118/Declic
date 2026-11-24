@@ -200,7 +200,7 @@ object Core {
                 val apk = app.applicationInfo.sourceDir
                 val pkg = app.packageName
                 val script = "pkill -x declic_moteur; pkill -f '[c]h[.]leico[.]declic[.]Engine'; " +
-                    "C=ch.leico.declic; CLASSPATH=$apk setsid app_process /system/bin --nice-name=declic_moteur \$C.Engine </dev/null >/dev/null 2>&1 & " +
+                    "C=ch.leico.declic; CLASSPATH=$apk setsid sh -c 'for g in /acct /dev/cg2_bpf /sys/fs/cgroup /sys/fs/cgroup/uid_0; do echo \$\$ > \$g/cgroup.procs; done 2>/dev/null; exec app_process /system/bin --nice-name=declic_moteur '\$C'.Engine' </dev/null >/dev/null 2>&1 & " +
                     "pm grant $pkg android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1; echo GRANT=\$?; " +
                     "(sleep 3; settings put global adb_wifi_enabled 0) </dev/null >/dev/null 2>&1 & " +
                     "echo FIN"
